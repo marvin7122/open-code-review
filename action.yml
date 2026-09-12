@@ -84,6 +84,21 @@ inputs:
   rule:
     description: Path to a custom rules JSON file passed to `ocr review --rule`.
     required: false
+  fan_out_project_rules:
+    description: >-
+      When true, pass `--fan-out-project-rules` so each matching project rule
+      gets an independent model review. Requires a source-built OCR binary that
+      includes that flag. Empty or false keeps first-match resolution.
+    required: false
+    default: 'false'
+  ocr_install_from:
+    description: >-
+      How to install the OCR CLI. `npm` (default) installs
+      @alibaba-group/open-code-review. `source` builds the CLI from this
+      action's checkout (GITHUB_ACTION_PATH), which is required for fork
+      features that are not on npm yet.
+    required: false
+    default: npm
   effort:
     description: >-
       Review effort preset passed to `ocr review --effort`. One of: low,
@@ -364,6 +379,8 @@ runs:
         MAX_TOKENS_BUDGET_INPUT: ${{ inputs.max_tokens_budget }}
         LLM_REASONING_EFFORT_INPUT: ${{ inputs.llm_reasoning_effort }}
         STREAM_PROGRESS_INPUT: ${{ inputs.stream_progress }}
+        FAN_OUT_INPUT: ${{ inputs.fan_out_project_rules }}
+        INSTALL_FROM_INPUT: ${{ inputs.ocr_install_from }}
       shell: bash
       run: |
         if [[ ! "$REVIEW_TASK_TIMEOUT" =~ ^[0-9]+$ ]]; then
@@ -444,11 +461,48 @@ runs:
         esac
         echo "STREAM_PROGRESS=$NORMALIZED_STREAM_PROGRESS" >> "$GITHUB_ENV"
 
+        NORMALIZED_FAN_OUT="$(printf '%s' "$FAN_OUT_INPUT" | tr '[:upper:]' '[:lower:]')"
+        case "$NORMALIZED_FAN_OUT" in
+          ""|false) NORMALIZED_FAN_OUT=false ;;
+          true) ;;
+          *)
+            echo "::error::fan_out_project_rules must be one of: true, false (got '$FAN_OUT_INPUT')"
+            exit 1
+            ;;
+        esac
+        echo "FAN_OUT_PROJECT_RULES=$NORMALIZED_FAN_OUT" >> "$GITHUB_ENV"
+
+        NORMALIZED_INSTALL_FROM="$(printf '%s' "$INSTALL_FROM_INPUT" | tr '[:upper:]' '[:lower:]')"
+        case "$NORMALIZED_INSTALL_FROM" in
+          ""|npm) NORMALIZED_INSTALL_FROM=npm ;;
+          source) ;;
+          *)
+            echo "::error::ocr_install_from must be one of: npm, source (got '$INSTALL_FROM_INPUT')"
+            exit 1
+            ;;
+        esac
+        echo "OCR_INSTALL_FROM=$NORMALIZED_INSTALL_FROM" >> "$GITHUB_ENV"
+
     - name: Install OpenCodeReview
       shell: bash
       env:
         OCR_VERSION: ${{ inputs.ocr_version }}
       run: |
+        if [ "${OCR_INSTALL_FROM:-npm}" = source ]; then
+          dest="${RUNNER_TEMP}/ocr-from-source"
+          mkdir -p "$dest"
+          if ! command -v go >/dev/null 2>&1; then
+            echo "::error::ocr_install_from=source requires a Go toolchain on the runner"
+            exit 1
+          fi
+          (cd "${GITHUB_ACTION_PATH}" && go build -o "${dest}/ocr" ./cmd/opencodereview)
+          echo "$dest" >> "$GITHUB_PATH"
+          echo "OpenCodeReview built from source at ${GITHUB_ACTION_PATH}:"
+          "${dest}/ocr" version || true
+          SOURCE_SHA="$(git -C "${GITHUB_ACTION_PATH}" rev-parse HEAD 2>/dev/null || echo unknown)"
+          echo "OCR_VERSION_ACTUAL=source-${SOURCE_SHA}" >> "$GITHUB_ENV"
+          exit 0
+        fi
         npm install -g "@alibaba-group/open-code-review@${OCR_VERSION}"
         echo "OpenCodeReview installed:"
         OCR_VERSION_OUTPUT="$(ocr version 2>/dev/null)" || {
@@ -620,6 +674,7 @@ runs:
         # invalidate the checkpoint. Both read the values Validate inputs
         # normalized into the environment, not the raw inputs.
         OCR_FP_EFFORT: ${{ env.EFFORT }}
+        OCR_FP_FAN_OUT_PROJECT_RULES: ${{ env.FAN_OUT_PROJECT_RULES }}
         OCR_FP_MAX_TOKENS_BUDGET: ${{ env.MAX_TOKENS_BUDGET }}
         # Extra headers can point the same `llm_model` string at a different
         # backend model or a different provider entirely, so they change what a
@@ -753,6 +808,7 @@ runs:
                 process.env.OCR_FP_LLM_AUTH_HEADER,
                 process.env.OCR_FP_LLM_TIMEOUT,
                 process.env.OCR_FP_EFFORT,
+                process.env.OCR_FP_FAN_OUT_PROJECT_RULES,
                 process.env.OCR_FP_MAX_TOKENS_BUDGET,
                 extraHeadersDigest,
                 process.env.OCR_FP_RULE,
@@ -829,6 +885,7 @@ runs:
         OCR_REVIEW_CONCURRENCY: ${{ inputs.review_concurrency }}
         OCR_BACKGROUND: ${{ inputs.background }}
         OCR_RULE: ${{ inputs.rule }}
+        FAN_OUT_PROJECT_RULES: ${{ env.FAN_OUT_PROJECT_RULES }}
         # Step output, not job env: empty when the resolve step was skipped or
         # chose the full range, and never inherited from an earlier use of this
         # action in the same job.
@@ -854,6 +911,7 @@ runs:
         [ -n "$OCR_REVIEW_CONCURRENCY" ] && ARGS+=(--concurrency "$OCR_REVIEW_CONCURRENCY")
         [ -n "$OCR_BACKGROUND" ] && ARGS+=(--background "$OCR_BACKGROUND")
         [ -n "$OCR_RULE" ] && ARGS+=(--rule "$OCR_RULE")
+        [ "${FAN_OUT_PROJECT_RULES:-false}" = "true" ] && ARGS+=(--fan-out-project-rules)
         [ -n "${EFFORT:-}" ] && ARGS+=(--effort "$EFFORT")
         [ -n "${MAX_TOKENS_BUDGET:-}" ] && ARGS+=(--max-tokens-budget "$MAX_TOKENS_BUDGET")
         set +e
