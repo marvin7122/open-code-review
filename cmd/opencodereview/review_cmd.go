@@ -50,6 +50,7 @@ type reviewOptions struct {
 	maxTokensBudget       int
 	effort                string
 	noFilter              bool
+	fanOutProjectRules    bool
 	preview               bool
 }
 
@@ -238,6 +239,7 @@ func executeReviewContext(ctx context.Context, opts reviewOptions) (retErr error
 		SealedInput:           sealedInput,
 		MaxTokensBudget:       int64(opts.maxTokensBudget),
 		SkipFilter:            opts.noFilter,
+		FanOutProjectRules:    opts.fanOutProjectRules,
 		RuntimeConfig:         rt.RuntimeConfig,
 	})
 

@@ -154,6 +154,10 @@ type Args struct {
 	// defines one. Set via the --no-filter CLI flag.
 	SkipFilter bool
 
+	// FanOutProjectRules creates one review task per matching project rule.
+	// False preserves the legacy semantic grouping and first-match behavior.
+	FanOutProjectRules bool
+
 	// RuntimeConfig carries the non-secret, allowlisted runtime settings that
 	// identify how this run was configured, for the manifest's
 	// runtime_config_sha256. It is populated by the cmd layer from the resolved
@@ -491,7 +495,12 @@ func (a *Agent) FileGroups() []FileGroupInfo {
 		for j, d := range g.Diffs {
 			files[j] = d.NewPath
 		}
-		result[i] = FileGroupInfo{Label: g.Label, Files: files}
+		result[i] = FileGroupInfo{
+			Label:        g.Label,
+			Files:        files,
+			RuleIdentity: g.RuleIdentity,
+			TaskKey:      g.TaskKey,
+		}
 	}
 	return result
 }
@@ -649,14 +658,28 @@ func (a *Agent) dispatchSubtasks(ctx context.Context) ([]model.LlmComment, error
 		}
 	}
 
-	// Group files semantically via LLM.
-	groupResult := groupDiffs(ctx, nonDeleted, a.args.LLMClient, a.args.Model,
-		a.args.Template, llmloop.PromptTokenLimit(a.args.Template.MaxTokens),
-		&groupingSessionOpts{session: a.session, provider: a.args.Provider, model: a.args.Model})
-	groups := groupResult.groups
+	var groups []FileGroup
+	var groupUsage *llm.UsageInfo
+	fanoutCommentSnapshot := -1
+	if a.args.FanOutProjectRules {
+		fanoutCommentSnapshot = a.args.CommentCollector.Snapshot()
+		groups = fanOutProjectRuleGroups(nonDeleted, a.args.SystemRule)
+	} else {
+		// Group files semantically via LLM.
+		groupResult := groupDiffs(ctx, nonDeleted, a.args.LLMClient, a.args.Model,
+			a.args.Template, llmloop.PromptTokenLimit(a.args.Template.MaxTokens),
+			&groupingSessionOpts{session: a.session, provider: a.args.Provider, model: a.args.Model})
+		groups = groupResult.groups
+		groupUsage = groupResult.usage
+	}
 	a.fileGroups = groups
-	if groupResult.usage != nil {
-		a.runner.RecordUsage(groupResult.usage)
+	if groupUsage != nil {
+		a.runner.RecordUsage(groupUsage)
+	}
+
+	var outcomes *fanoutTracker
+	if a.args.FanOutProjectRules {
+		outcomes = newFanoutTracker(groups)
 	}
 
 	var wg sync.WaitGroup
@@ -732,8 +755,12 @@ dispatchLoop:
 					atomic.AddInt64(&a.subtaskFailed, int64(len(g.Diffs)))
 					for _, d := range g.Diffs {
 						fingerprint := reviewItemFingerprint(a.reviewMode(), d)
-						a.markFailed(d, session.FailurePanic, "subtask panicked during review")
-						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r))
+						if outcomes != nil {
+							outcomes.fail(d, session.FailurePanic, "subtask panicked during review", fmt.Sprintf("panic: %v", r))
+						} else {
+							a.markFailed(d, session.FailurePanic, "subtask panicked during review")
+							a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, fmt.Sprintf("panic: %v", r))
+						}
 					}
 					fmt.Fprintf(stdout.Writer(), "[ocr] Subtask panic for group %q: %v\n%s\n", g.Label, r, debug.Stack())
 					telemetry.ErrorEvent(ctx, "subtask.panic", fmt.Errorf("panic: %v", r),
@@ -757,8 +784,12 @@ dispatchLoop:
 				class, reason := classifyItemError(err)
 				for _, d := range g.Diffs {
 					fingerprint := reviewItemFingerprint(a.reviewMode(), d)
-					a.markFailed(d, class, reason)
-					a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, err.Error())
+					if outcomes != nil {
+						outcomes.fail(d, class, reason, err.Error())
+					} else {
+						a.markFailed(d, class, reason)
+						a.session.RecordReviewItemFailed(d.NewPath, d.OldPath, d.NewPath, fingerprint, err.Error())
+					}
 				}
 				fmt.Fprintf(stdout.Writer(), "[ocr] Subtask error for group %q: %v\n", g.Label, err)
 				telemetry.ErrorEvent(groupCtx, "subtask.error", err,
@@ -778,6 +809,11 @@ dispatchLoop:
 					var failedCount int64
 					for _, d := range g.Diffs {
 						fingerprint := reviewItemFingerprint(a.reviewMode(), d)
+						if outcomes != nil {
+							outcomes.fail(d, stop.class, stop.reason, stop.checkpoint)
+							failedCount++
+							continue
+						}
 						if comments := a.args.CommentCollector.CommentsForPath(d.NewPath); len(comments) > 0 {
 							a.markCompleted(d)
 							a.session.RecordReviewItemDone(d.NewPath, d.OldPath, d.NewPath, fingerprint, comments)
@@ -807,6 +843,10 @@ dispatchLoop:
 			}
 			for _, d := range g.Diffs {
 				fingerprint := reviewItemFingerprint(a.reviewMode(), d)
+				if outcomes != nil {
+					outcomes.succeed(d)
+					continue
+				}
 				comments := a.args.CommentCollector.CommentsForPath(d.NewPath)
 				a.markCompleted(d)
 				a.session.RecordReviewItemDone(d.NewPath, d.OldPath, d.NewPath, fingerprint, comments)
@@ -818,6 +858,12 @@ dispatchLoop:
 	// All subtasks finished — collect comments from the global collector once.
 	if a.args.CommentWorkerPool != nil {
 		a.args.CommentWorkerPool.Await()
+	}
+	if fanoutCommentSnapshot >= 0 {
+		a.deduplicateFanoutComments(fanoutCommentSnapshot)
+	}
+	if outcomes != nil {
+		outcomes.finalize(a)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		a.recordContextFailure(ctxErr)
@@ -1061,6 +1107,9 @@ func (a *Agent) ruleConfigSHA256() string {
 			fields = append(fields, "exclude", exc)
 		}
 	}
+	if a.args.FanOutProjectRules {
+		fields = append(fields, "fan_out_project_rules", "1")
+	}
 	return hashFields(fields...)
 }
 
@@ -1084,6 +1133,7 @@ func (a *Agent) runtimeConfigSHA256() string {
 		"timeout", r.Timeout.String(),
 		"concurrency", strconv.Itoa(a.args.MaxConcurrency),
 		"max_tokens_budget", strconv.FormatInt(a.args.MaxTokensBudget, 10),
+		"fan_out_project_rules", strconv.FormatBool(a.args.FanOutProjectRules),
 	)
 }
 
@@ -1367,7 +1417,7 @@ func diffsChurn(diffs []model.Diff) (total, maxFile int64) {
 // for a non-error early exit (token budget, main-loop stop) carrying the manifest
 // class recorded at its trigger point. A completed review returns (true, nil, nil).
 func (a *Agent) executeGroupSubtask(ctx context.Context, g FileGroup) (bool, *subtaskStop, error) {
-	groupKey := fileGroupKey(g.Diffs)
+	groupKey := groupTaskKey(g)
 	ctx, span := telemetry.StartSpan(ctx, "subtask.execute.group."+groupKey)
 	defer span.End()
 
@@ -1387,8 +1437,9 @@ func (a *Agent) executeGroupSubtask(ctx context.Context, g FileGroup) (bool, *su
 	// Build change-files list excluding all group members
 	changeFilesExcludingGroup := a.buildChangeFilesExceptGroup(g.Diffs)
 
-	// Merge system rules for all files in the group
-	rule := a.resolveGroupSystemRule(g.Diffs)
+	// Fan-out tasks carry their resolved rule explicitly; legacy groups retain
+	// the existing first-match/merge behavior.
+	rule := a.resolveGroupRule(g)
 
 	// Phase 1: Plan (skip when changes are below threshold)
 	planEnabled := a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0
@@ -1658,6 +1709,12 @@ func (a *Agent) buildChangeFilesExceptGroup(groupDiffs []model.Diff) string {
 // A group covered by a single rule set — every single-file group, and every group
 // whose files share a language — returns that rule text bare, so the rendered
 // prompt stays byte-identical to the untagged form.
+func (a *Agent) resolveGroupRule(g FileGroup) string {
+	if g.Rule != "" {
+		return g.Rule
+	}
+	return a.resolveGroupSystemRule(g.Diffs)
+}
 func (a *Agent) resolveGroupSystemRule(diffs []model.Diff) string {
 	if a.args.SystemRule == nil {
 		return ""
@@ -1712,7 +1769,29 @@ func (a *Agent) resolveGroupSystemRule(diffs []model.Diff) string {
 	return sb.String()
 }
 
-// executeGroupPlanPhase runs the plan phase for a file group.
+// deduplicateFanoutComments removes only comments generated by this fan-out run;
+// legacy collection behavior is untouched.
+func (a *Agent) deduplicateFanoutComments(snapshot int) {
+	if a.args.CommentCollector == nil {
+		return
+	}
+	comments := a.args.CommentCollector.Since(snapshot)
+	if len(comments) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(comments))
+	unique := comments[:0]
+	for _, cm := range comments {
+		key := fmt.Sprintf("%s\x00%d\x00%d\x00%s\x00%s\x00%s", cm.Path, cm.StartLine, cm.EndLine, cm.Content, cm.SuggestionCode, cm.ExistingCode)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, cm)
+	}
+	a.args.CommentCollector.ReplaceSince(snapshot, unique)
+}
+
 func (a *Agent) executeGroupPlanPhase(ctx context.Context, g FileGroup, concatenatedDiffs, changeFiles, rule string) (string, error) {
 	ctx, span := telemetry.StartSpan(ctx, "plan.execute")
 	defer span.End()
@@ -1731,7 +1810,7 @@ func (a *Agent) executeGroupPlanPhase(ctx context.Context, g FileGroup, concaten
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
 
-	gk := fileGroupKey(g.Diffs)
+	gk := groupTaskKey(g)
 	fs := a.session.GetOrCreateFileSession(gk)
 	rec := fs.AppendTaskRecord(session.PlanTask, messages)
 	ctx = llm.ContextWithSessionKey(ctx,
@@ -1771,7 +1850,7 @@ func (a *Agent) executeGroupPlanPhase(ctx context.Context, g FileGroup, concaten
 // are candidates for filtering (per-round isolation). When from is nil, all
 // comments for the group's paths are filtered (legacy full-group behavior).
 func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from map[string]int) {
-	groupKey := fileGroupKey(g.Diffs)
+	groupKey := groupTaskKey(g)
 	ctx, span := telemetry.StartSpan(ctx, "review_filter.execute")
 	defer span.End()
 	telemetry.SetAttr(span, "group.label", groupKey)

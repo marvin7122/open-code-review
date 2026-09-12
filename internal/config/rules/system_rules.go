@@ -142,6 +142,13 @@ type DetailResolver interface {
 	ResolveDetail(path string) RuleDetail
 }
 
+// ProjectRuleResolver exposes every matching rule from the project layer. The
+// declaration order is significant for callers that opt into per-rule review;
+// Resolve remains the legacy first-match API.
+type ProjectRuleResolver interface {
+	ResolveAllProjectRules(path string) []RuleDetail
+}
+
 // Resolve returns the rule text for a given file path.
 // Patterns with brace expansion like "*.{go,py}" are expanded into "*.go", "*.py".
 // The first match wins; if none match, it falls back to DefaultRule.
@@ -518,6 +525,42 @@ func (c *composedResolver) ResolveDetail(path string) RuleDetail {
 		return *detail
 	}
 	return c.system.resolveDetail(path)
+}
+
+// ResolveAllProjectRules returns every matching project rule in declaration
+// order. Custom and global rules are deliberately excluded: fan-out is an
+// opt-in project-rule feature, not a second interpretation of layer priority.
+func (c *composedResolver) ResolveAllProjectRules(path string) []RuleDetail {
+	return c.matchProjectRuleDetails(c.project, path, "project")
+}
+
+func (c *composedResolver) matchProjectRuleDetails(pr *ProjectRule, path, source string) []RuleDetail {
+	if pr == nil {
+		return nil
+	}
+	var details []RuleDetail
+	for i := range pr.Rules {
+		entry := &pr.Rules[i]
+		if entry.Rule == "" && !entry.MergeSystemRule {
+			continue
+		}
+		matched := false
+		for _, pattern := range expandBraces(entry.Path) {
+			if ok, _ := doublestar.Match(strings.ToLower(pattern), strings.ToLower(path)); ok {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		rule := entry.Rule
+		if entry.MergeSystemRule {
+			rule = c.mergeWithSystemRule(path, rule)
+		}
+		details = append(details, RuleDetail{Rule: rule, Source: source, Pattern: entry.Path})
+	}
+	return details
 }
 
 func (c *composedResolver) matchProjectRuleDetail(pr *ProjectRule, path, source string) *RuleDetail {

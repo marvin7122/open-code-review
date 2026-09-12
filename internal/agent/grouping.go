@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alibaba/open-code-review/internal/config/rules"
 	"github.com/alibaba/open-code-review/internal/config/template"
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/model"
@@ -28,14 +29,19 @@ const smallChangeSetLabel = "small change set"
 
 // FileGroup is a set of semantically related diffs to be reviewed in one LLM call.
 type FileGroup struct {
-	Label string
-	Diffs []model.Diff
+	Label        string
+	Diffs        []model.Diff
+	Rule         string
+	RuleIdentity string
+	TaskKey      string
 }
 
 // FileGroupInfo is the exported, JSON-friendly representation of a file group.
 type FileGroupInfo struct {
-	Label string   `json:"label"`
-	Files []string `json:"files"`
+	Label        string   `json:"label"`
+	Files        []string `json:"files"`
+	RuleIdentity string   `json:"rule_identity,omitempty"`
+	TaskKey      string   `json:"task_key,omitempty"`
 }
 
 type groupingResponse struct {
@@ -368,6 +374,42 @@ func fileGroupKey(diffs []model.Diff) string {
 	}
 	sort.Strings(paths)
 	return strings.Join(paths, ",")
+}
+
+func groupTaskKey(g FileGroup) string {
+	if g.TaskKey != "" {
+		return g.TaskKey
+	}
+	return fileGroupKey(g.Diffs)
+}
+
+// fanOutProjectRuleGroups bypasses semantic grouping and creates one task for
+// every matching project rule. Files with no project match retain one fallback
+// task using the legacy resolver behavior.
+func fanOutProjectRuleGroups(diffs []model.Diff, resolver rules.Resolver) []FileGroup {
+	all, ok := resolver.(rules.ProjectRuleResolver)
+	if !ok {
+		return toSingleFileGroups(diffs)
+	}
+	var groups []FileGroup
+	for _, d := range diffs {
+		matches := all.ResolveAllProjectRules(d.NewPath)
+		if len(matches) == 0 {
+			groups = append(groups, FileGroup{Label: d.NewPath, Diffs: []model.Diff{d}})
+			continue
+		}
+		for i, match := range matches {
+			identity := fmt.Sprintf("%s#%d", match.Pattern, i)
+			groups = append(groups, FileGroup{
+				Label:        d.NewPath + " [project rule " + identity + "]",
+				Diffs:        []model.Diff{d},
+				Rule:         match.Rule,
+				RuleIdentity: identity,
+				TaskKey:      d.NewPath + "::project-rule::" + identity,
+			})
+		}
+	}
+	return groups
 }
 
 func toSingleFileGroups(diffs []model.Diff) []FileGroup {
