@@ -96,9 +96,25 @@ inputs:
       How to install the OCR CLI. `npm` (default) installs
       @alibaba-group/open-code-review. `source` builds the CLI from this
       action's checkout (GITHUB_ACTION_PATH), which is required for fork
-      features that are not on npm yet.
+      features that are not on npm yet. `release` downloads a prebuilt
+      binary for the exact checkout commit from a rolling GitHub release
+      instead of compiling, so review runs never pay for a build.
     required: false
     default: npm
+  ocr_release_repo:
+    description: >-
+      Repository hosting the rolling release used by
+      `ocr_install_from=release`, in owner/name form.
+    required: false
+    default: marvin7122/open-code-review
+  ocr_release_tag:
+    description: >-
+      Rolling release tag used by `ocr_install_from=release`. The tag
+      accumulates one linux asset per commit; the asset matching the exact
+      checkout SHA is downloaded, so the binary always matches the action
+      code.
+    required: false
+    default: fanout-rolling
   effort:
     description: >-
       Review effort preset passed to `ocr review --effort`. One of: low,
@@ -475,9 +491,9 @@ runs:
         NORMALIZED_INSTALL_FROM="$(printf '%s' "$INSTALL_FROM_INPUT" | tr '[:upper:]' '[:lower:]')"
         case "$NORMALIZED_INSTALL_FROM" in
           ""|npm) NORMALIZED_INSTALL_FROM=npm ;;
-          source) ;;
+          source|release) ;;
           *)
-            echo "::error::ocr_install_from must be one of: npm, source (got '$INSTALL_FROM_INPUT')"
+            echo "::error::ocr_install_from must be one of: npm, source, release (got '$INSTALL_FROM_INPUT')"
             exit 1
             ;;
         esac
@@ -487,6 +503,8 @@ runs:
       shell: bash
       env:
         OCR_VERSION: ${{ inputs.ocr_version }}
+        OCR_RELEASE_REPO: ${{ inputs.ocr_release_repo }}
+        OCR_RELEASE_TAG: ${{ inputs.ocr_release_tag }}
       run: |
         if [ "${OCR_INSTALL_FROM:-npm}" = source ]; then
           dest="${RUNNER_TEMP}/ocr-from-source"
@@ -501,6 +519,50 @@ runs:
           "${dest}/ocr" version || true
           SOURCE_SHA="$(git -C "${GITHUB_ACTION_PATH}" rev-parse HEAD 2>/dev/null || echo unknown)"
           echo "OCR_VERSION_ACTUAL=source-${SOURCE_SHA}" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        if [ "${OCR_INSTALL_FROM:-npm}" = release ]; then
+          dest="${RUNNER_TEMP}/ocr-from-release"
+          mkdir -p "$dest"
+          # The rolling release publishes one asset per commit, so resolving
+          # the checkout SHA here guarantees the binary matches this code.
+          ACTION_SHA="$(git -C "${GITHUB_ACTION_PATH}" rev-parse HEAD 2>/dev/null)" || {
+            echo "::error::ocr_install_from=release needs the action checkout SHA, but git rev-parse failed in '${GITHUB_ACTION_PATH}'"
+            exit 1
+          }
+          case "${ACTION_SHA}" in
+            ''|*[!0-9a-f]*)
+              echo "::error::ocr_install_from=release resolved an invalid checkout SHA '${ACTION_SHA}'"
+              exit 1
+              ;;
+          esac
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) RELEASE_PLATFORM=linux-amd64 ;;
+            Linux-aarch64|Linux-arm64) RELEASE_PLATFORM=linux-arm64 ;;
+            *)
+              echo "::error::ocr_install_from=release has no prebuilt binary for '$(uname -s)/$(uname -m)'; the rolling release currently publishes linux assets only"
+              exit 1
+              ;;
+          esac
+          RELEASE_ASSET="opencodereview-${RELEASE_PLATFORM}-${ACTION_SHA}"
+          RELEASE_BASE_URL="https://github.com/${OCR_RELEASE_REPO}/releases/download/${OCR_RELEASE_TAG}"
+          if ! curl -fsSL -o "${dest}/ocr" "${RELEASE_BASE_URL}/${RELEASE_ASSET}"; then
+            echo "::error::ocr_install_from=release could not download ${RELEASE_ASSET} from ${OCR_RELEASE_REPO}@${OCR_RELEASE_TAG}; the Fan-out rolling release workflow publishes one asset per commit, so this checkout may predate it or that build may have failed"
+            exit 1
+          fi
+          if ! curl -fsSL -o "${dest}/ocr.sha256" "${RELEASE_BASE_URL}/${RELEASE_ASSET}.sha256"; then
+            echo "::error::ocr_install_from=release downloaded the binary but its checksum sidecar is missing; refusing to run an unverified binary"
+            exit 1
+          fi
+          if ! (cd "$dest" && sha256sum -c ocr.sha256); then
+            echo "::error::ocr_install_from=release checksum mismatch for ${RELEASE_ASSET}; refusing to run it"
+            exit 1
+          fi
+          chmod +x "${dest}/ocr"
+          echo "$dest" >> "$GITHUB_PATH"
+          echo "OpenCodeReview installed from ${OCR_RELEASE_REPO} release ${OCR_RELEASE_TAG}:"
+          "${dest}/ocr" version || true
+          echo "OCR_VERSION_ACTUAL=release-${ACTION_SHA}" >> "$GITHUB_ENV"
           exit 0
         fi
         npm install -g "@alibaba-group/open-code-review@${OCR_VERSION}"

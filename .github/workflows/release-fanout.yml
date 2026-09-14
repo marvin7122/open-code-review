@@ -1,0 +1,129 @@
+name: Fan-out rolling release
+
+# Builds the OCR CLI once per commit on the fan-out branch and publishes it
+# as a per-commit asset on the `fanout-rolling` release. Review runs with
+# `ocr_install_from=release` download the asset matching their exact action
+# checkout SHA, so they never compile and the binary always matches the code.
+on:
+  push:
+    branches: [feat/per-rule-review-fanout]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Uploads to one shared release must not interleave; queue them instead.
+concurrency:
+  group: fanout-rolling-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    container:
+      image: golang:1.26.6
+      options: --cpus=2
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trust workspace
+        run: git config --global --replace-all safe.directory '*'
+
+      - name: Build linux-x64 binary for this commit
+        run: |
+          FULL_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          LD_FLAGS="-s -w -X main.Version=fanout-rolling -X main.GitCommit=${SHORT_SHA} -X main.BuildDate=${BUILD_DATE}"
+          BIN_NAME="opencodereview-linux-amd64-${FULL_SHA}"
+          CGO_ENABLED=0 go build -trimpath -ldflags "${LD_FLAGS}" -o "${BIN_NAME}" ./cmd/opencodereview
+          sha256sum "${BIN_NAME}" > "${BIN_NAME}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fanout-rolling-binary
+          path: opencodereview-linux-amd64-*
+
+  publish:
+    needs: build
+    runs-on: self-hosted
+    timeout-minutes: 20
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install tools
+        run: apt-get update && apt-get install -y git curl jq
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fanout-rolling-binary
+
+      - name: Ensure rolling release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases" \
+            -d "{\"tag_name\":\"fanout-rolling\",\"target_commitish\":\"${GITHUB_SHA}\",\"name\":\"Fan-out rolling build\",\"body\":\"Per-commit linux-x64 OCR binaries for the fan-out branch. Review runs download the asset matching their exact action checkout SHA.\",\"prerelease\":true,\"make_latest\":\"false\"}")"
+          if [ "${CODE}" != 201 ] && [ "${CODE}" != 422 ]; then
+            echo "::error::could not ensure the fanout-rolling release exists (HTTP ${CODE})"
+            exit 1
+          fi
+
+      - name: Upload per-commit binary
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: fanout-rolling
+          target_commitish: ${{ github.sha }}
+          make_latest: false
+          files: opencodereview-linux-amd64-*
+
+      - name: Move rolling tag to this commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/fanout-rolling"
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "${REF_URL}" -d "{\"sha\":\"${GITHUB_SHA}\",\"force\":true}")"
+          if [ "${CODE}" = 404 ] || [ "${CODE}" = 422 ]; then
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
+              -d "{\"ref\":\"refs/tags/fanout-rolling\",\"sha\":\"${GITHUB_SHA}\"}")"
+          fi
+          if [ "${CODE}" != 200 ] && [ "${CODE}" != 201 ]; then
+            echo "::error::could not move the fanout-rolling tag (HTTP ${CODE})"
+            exit 1
+          fi
+
+      - name: Prune older per-commit assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Keep the 10 newest per-commit binaries (plus their checksum
+          # sidecars) so the release does not grow without bound.
+          ASSETS_JSON="$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/fanout-rolling?per_page=100")"
+          STALE_URLS="$(echo "${ASSETS_JSON}" | jq -r '
+            [.assets[]? | select(.name | test("^opencodereview-linux-[a-z0-9]+-[0-9a-f]{40}(\\.sha256)?$"))]
+            | sort_by(.created_at)
+            | (map(select(.name | endswith(".sha256") | not)) | .[0:-10] | map(.name)) as $stale
+            | .[] | .name as $n | select($stale | index($n) or index($n | rtrimstr(".sha256"))) | .url')"
+          if [ -z "${STALE_URLS}" ]; then
+            echo "Nothing to prune."
+            exit 0
+          fi
+          echo "${STALE_URLS}" | while IFS= read -r url; do
+            [ -n "${url}" ] || continue
+            echo "Deleting ${url}"
+            curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' "${url}"
+          done
