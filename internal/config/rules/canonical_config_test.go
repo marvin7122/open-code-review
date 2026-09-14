@@ -98,3 +98,33 @@ func TestComposedResolverCanonicalConfig_ProjectRuleChangeChangesOutput(t *testi
 		t.Error("changing a project rule did not change CanonicalConfig")
 	}
 }
+
+func TestComposedResolverCanonicalConfig_TriggerChangeChangesOutput(t *testing.T) {
+	build := func(triggerJSON string) string {
+		t.Helper()
+		home := t.TempDir()
+		setTestHome(t, home)
+		dir := t.TempDir()
+		ocrDir := filepath.Join(dir, ".opencodereview")
+		if err := os.MkdirAll(ocrDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		ruleJSON := `{"rules":[{"path":"a/**","rule":"same-rule","trigger":` + triggerJSON + `}]}`
+		if err := os.WriteFile(filepath.Join(ocrDir, "rule.json"), []byte(ruleJSON), 0o644); err != nil {
+			t.Fatalf("write rule.json: %v", err)
+		}
+		resolver, _, err := NewResolver(dir, "", ResolverOptions{})
+		if err != nil {
+			t.Fatalf("NewResolver: %v", err)
+		}
+		return strings.Join(resolver.(canonicalConfigurer).CanonicalConfig(), "\x00")
+	}
+	withoutTriggers := build(`null`)
+	withTriggers := build(`["string_view"]`)
+	if withoutTriggers == withTriggers {
+		t.Error("adding triggers did not change CanonicalConfig")
+	}
+	if build(`["string_view"]`) == build(`["span"]`) {
+		t.Error("changing triggers did not change CanonicalConfig")
+	}
+}

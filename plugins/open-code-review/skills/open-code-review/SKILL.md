@@ -165,6 +165,8 @@ Rule file format:
 }
 ```
 
+Optional `trigger` (RE2 regex list) names constructs the rule reasons about. In per-rule fan-out, the rule's task for a file is skipped unless a trigger matches the file's diff or new content — e.g. `"trigger": ["string_view", "span"]`. Omit it to always run; rules about absence (missing headers, missing checks) must omit it. Malformed patterns fail the run at load time.
+
 To preview which rule applies to a file before reviewing:
 
 ```bash

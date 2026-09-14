@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -400,16 +401,50 @@ func fanOutProjectRuleGroups(diffs []model.Diff, resolver rules.Resolver) []File
 		}
 		for i, match := range matches {
 			identity := fmt.Sprintf("%s#%d", match.Pattern, i)
+			taskKey := d.NewPath + "::project-rule::" + identity
+			// Match against the diff and the full new content: a construct
+			// the rule reasons about (e.g. noexcept on a declaration) may
+			// live outside the changed hunks.
+			if !ruleTriggersHit(d.Diff+"\n"+d.NewFileContent, match.Trigger) {
+				fmt.Fprintf(stdout.Writer(), "[ocr] skipping group %q: no rule trigger match\n", taskKey)
+				continue
+			}
 			groups = append(groups, FileGroup{
 				Label:        d.NewPath + " [project rule " + identity + "]",
 				Diffs:        []model.Diff{d},
 				Rule:         match.Rule,
 				RuleIdentity: identity,
-				TaskKey:      d.NewPath + "::project-rule::" + identity,
+				TaskKey:      taskKey,
 			})
 		}
 	}
 	return groups
+}
+
+// ruleTriggersHit reports whether a project rule's review task should be
+// created for a file. An empty trigger list always runs: the gate is
+// fail-open, and rules about absence (missing headers, missing checks) must
+// omit triggers. Otherwise at least one RE2 trigger must match the text
+// under review (the unified diff plus the full new file content, since a
+// construct the rule reasons about may live outside the changed hunks).
+// Matching is case-sensitive: code constructs are. An uncompilable pattern
+// fails open with a warning; triggers are validated at rule load, so this
+// only fires for programmatically built resolvers.
+func ruleTriggersHit(diffText string, triggers []string) bool {
+	if len(triggers) == 0 {
+		return true
+	}
+	for _, pattern := range triggers {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: ignoring invalid rule trigger %q: %v\n", pattern, err)
+			return true
+		}
+		if re.MatchString(diffText) {
+			return true
+		}
+	}
+	return false
 }
 
 func toSingleFileGroups(diffs []model.Diff) []FileGroup {
