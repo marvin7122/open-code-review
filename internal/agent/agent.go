@@ -2032,16 +2032,27 @@ func parseFilterToolCalls(calls []llm.ToolCall, total int) map[int]struct{} {
 
 // parseFilterResponse extracts comment indices from the LLM filter response.
 // Returns a set of 0-based indices. Invalid IDs or out-of-range indices are ignored.
+// Besides the bare JSON array, the {"comment_ids": [...]} object shape is
+// accepted: models emit it regularly, and rejecting it only wastes a filter
+// pass. Anything else (prose, analysis objects) returns nil, which the caller
+// treats as keep-everything — a mention of an ID in analysis text is not a
+// verdict, so IDs are never scraped from free text.
 func parseFilterResponse(raw string, total int) map[int]struct{} {
 	raw = llmloop.StripMarkdownFences(raw)
 	var ids []string
 	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
-		preview := raw
-		if len(preview) > 200 {
-			preview = preview[:200] + "..."
+		var wrapped struct {
+			CommentIDs []string `json:"comment_ids"`
 		}
-		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter: failed to parse LLM response: %v, raw: %s\n", err, preview)
-		return nil
+		if werr := json.Unmarshal([]byte(raw), &wrapped); werr != nil || wrapped.CommentIDs == nil {
+			preview := raw
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			fmt.Fprintf(stdout.Writer(), "[ocr] Review filter: failed to parse LLM response: %v, raw: %s\n", err, preview)
+			return nil
+		}
+		ids = wrapped.CommentIDs
 	}
 	indices := make(map[int]struct{})
 	for _, id := range ids {
