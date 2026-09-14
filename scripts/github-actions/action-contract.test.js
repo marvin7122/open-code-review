@@ -214,6 +214,7 @@ function makeFixture() {
   fs.mkdirSync(bin);
   const callsPath = path.join(dir, "calls.jsonl");
   const npmCallsPath = path.join(dir, "npm-calls.jsonl");
+  const curlCallsPath = path.join(dir, "curl-calls.jsonl");
   const configPath = path.join(dir, "config.jsonl");
   const resultPath = path.join(dir, "ocr-result.json");
   const stderrPath = path.join(dir, "ocr-stderr.log");
@@ -252,12 +253,36 @@ const args = process.argv.slice(2);
 fs.appendFileSync(process.env.OCR_NPM_CALLS, JSON.stringify(args) + "\\n");
 process.stdout.write("npm " + args.join(" ") + "\\n");
 `;
-  for (const [name, body] of [["ocr", ocrScript], ["npm", npmScript]]) {
+  // Fake curl for the release install mode: serves the binary and its
+  // checksum sidecar the way the rolling release does, so the real
+  // sha256sum verification in action.yml runs unmodified.
+  const curlScript = `#!/usr/bin/env node
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.OCR_CURL_CALLS, JSON.stringify(args) + "\\n");
+const failStatus = Number(process.env.OCR_FAKE_CURL_STATUS || 0);
+if (failStatus !== 0) process.exit(failStatus);
+const outIndex = args.indexOf("-o");
+const url = args[args.length - 1];
+const dest = outIndex >= 0 ? args[outIndex + 1] : null;
+if (!dest) process.exit(0);
+if (url.endsWith(".sha256")) {
+  const binPath = dest.replace(/\\.sha256$/, "");
+  const digest = crypto.createHash("sha256").update(fs.readFileSync(binPath)).digest("hex");
+  const body = (process.env.OCR_FAKE_CURL_CORRUPT === "1" ? "0".repeat(64) : digest) + "  " + path.basename(binPath) + "\\n";
+  fs.writeFileSync(dest, body);
+} else {
+  fs.writeFileSync(dest, "#!/bin/sh\\necho 'open-code-review fanout-rolling contract-test'\\n");
+}
+`;
+  for (const [name, body] of [["ocr", ocrScript], ["npm", npmScript], ["curl", curlScript]]) {
     const file = path.join(bin, name);
     fs.writeFileSync(file, body, { mode: 0o755 });
   }
 
-  return { dir, bin, callsPath, npmCallsPath, configPath, resultPath, stderrPath };
+  return { dir, bin, callsPath, npmCallsPath, curlCallsPath, configPath, resultPath, stderrPath };
 }
 
 function removeFixture(fixture) {
@@ -271,6 +296,7 @@ function runShell(script, env, fixture) {
       PATH: `${fixture.bin}:${process.env.PATH || ""}`,
       OCR_CALLS: fixture.callsPath,
       OCR_NPM_CALLS: fixture.npmCallsPath,
+      OCR_CURL_CALLS: fixture.curlCallsPath,
       OCR_CONFIG: fixture.configPath,
       GITHUB_OUTPUT: path.join(fixture.dir, "github-output"),
       GITHUB_ENV: path.join(fixture.dir, "github-env"),
@@ -1317,6 +1343,161 @@ function testOfficialNpmPackageInstallIsPreserved() {
   }
 }
 
+function makeReleaseCheckout() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "open-code-review-release-checkout-"));
+  const gitEnv = {
+    GIT_AUTHOR_NAME: "contract",
+    GIT_AUTHOR_EMAIL: "contract@test",
+    GIT_COMMITTER_NAME: "contract",
+    GIT_COMMITTER_EMAIL: "contract@test",
+    GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+    GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+  };
+  const git = (args) => {
+    const result = spawnSync("git", args, {
+      cwd: dir,
+      env: Object.assign({}, process.env, gitEnv),
+      encoding: "utf8",
+    });
+    assert.strictEqual(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+    return result;
+  };
+  git(["init", "-q"]);
+  fs.writeFileSync(path.join(dir, "action.yml"), "# release fixture\n");
+  git(["add", "."]);
+  git(["commit", "-q", "-m", "fixture"]);
+  const sha = git(["rev-parse", "HEAD"]).stdout.trim();
+  assert.match(sha, /^[0-9a-f]{40}$/, "the release fixture must resolve a full commit SHA");
+  return { dir, sha };
+}
+
+function releasePlatformSuffix() {
+  if (process.arch === "x64") return "linux-amd64";
+  if (process.arch === "arm64") return "linux-arm64";
+  assert.fail(`contract tests support only x64/arm64 runners, got ${process.arch}`);
+  return null;
+}
+
+function runInstallRelease(fixture, checkoutDir, extraEnv = {}) {
+  const install = installStep();
+  assert.ok(install, "action.yml must retain the Install OpenCodeReview step");
+  return runStep(
+    install,
+    inputValues({ ocr_install_from: "release" }),
+    fixture,
+    Object.assign(
+      {
+        // Each contract step runs in a fresh shell, so the normalized value
+        // the Validate step would export via GITHUB_ENV is injected directly,
+        // mirroring how the EFFORT and STREAM_PROGRESS tests work.
+        OCR_INSTALL_FROM: "release",
+        RUNNER_TEMP: fixture.dir,
+        GITHUB_ACTION_PATH: checkoutDir,
+        GITHUB_PATH: path.join(fixture.dir, "github-path"),
+      },
+      extraEnv
+    )
+  );
+}
+
+function testInstallReleaseDownloadsPerCommitBinary() {
+  const checkout = makeReleaseCheckout();
+  const fixture = makeFixture();
+  try {
+    const result = runInstallRelease(fixture, checkout.dir);
+    assert.strictEqual(result.status, 0, `Install release block failed; ${resultDescription(result)}`);
+    const expectedAsset = `opencodereview-${releasePlatformSuffix()}-${checkout.sha}`;
+    const curlCalls = readJsonLines(fixture.curlCallsPath);
+    const download = curlCalls.find((args) => args[args.length - 1].endsWith(`/${expectedAsset}`));
+    assert.ok(download, `release install must download the per-commit asset ${expectedAsset}`);
+    assert.match(
+      download[download.length - 1],
+      /^https:\/\/github\.com\/marvin7122\/open-code-review\/releases\/download\/fanout-rolling\//,
+      "release install must use the default rolling release location"
+    );
+    assert.ok(
+      curlCalls.some((args) => args[args.length - 1].endsWith(`/${expectedAsset}.sha256`)),
+      "release install must download the checksum sidecar"
+    );
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /OpenCodeReview installed from marvin7122\/open-code-review release fanout-rolling/,
+      "release install must report the release it installed from"
+    );
+    const addedPaths = fs.readFileSync(path.join(fixture.dir, "github-path"), "utf8").split(/\r?\n/).filter(Boolean);
+    assert.strictEqual(addedPaths.length, 1, "release install must add exactly one directory to PATH");
+    const ocrBinary = path.join(addedPaths[0], "ocr");
+    assert.ok(fs.existsSync(ocrBinary), "release install must place the ocr binary on PATH");
+    const version = spawnSync(ocrBinary, ["version"], { encoding: "utf8" });
+    assert.strictEqual(version.status, 0, "the installed release binary must execute");
+    const envAssignments = readEnvAssignments(path.join(fixture.dir, "github-env"));
+    assert.strictEqual(
+      envAssignments.OCR_VERSION_ACTUAL,
+      `release-${checkout.sha}`,
+      "release install must record the exact checkout SHA as the installed version"
+    );
+  } finally {
+    removeFixture(fixture);
+    fs.rmSync(checkout.dir, { recursive: true, force: true });
+  }
+}
+
+function testInstallReleaseRefusesChecksumMismatch() {
+  const checkout = makeReleaseCheckout();
+  const fixture = makeFixture();
+  try {
+    const result = runInstallRelease(fixture, checkout.dir, { OCR_FAKE_CURL_CORRUPT: "1" });
+    assert.notStrictEqual(result.status, 0, "a corrupted release binary must fail the install");
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /::error::ocr_install_from=release checksum mismatch/,
+      "a checksum mismatch must refuse to run the binary"
+    );
+  } finally {
+    removeFixture(fixture);
+    fs.rmSync(checkout.dir, { recursive: true, force: true });
+  }
+}
+
+function testInstallReleaseFailsClosedOnMissingAsset() {
+  const checkout = makeReleaseCheckout();
+  const fixture = makeFixture();
+  try {
+    const result = runInstallRelease(fixture, checkout.dir, { OCR_FAKE_CURL_STATUS: "22" });
+    assert.notStrictEqual(result.status, 0, "a missing release asset must fail the install");
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /::error::ocr_install_from=release could not download/,
+      "a missing asset must produce an actionable download error"
+    );
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /Fan-out rolling release/,
+      "a missing asset must point at the workflow that publishes it"
+    );
+  } finally {
+    removeFixture(fixture);
+    fs.rmSync(checkout.dir, { recursive: true, force: true });
+  }
+}
+
+function testValidateInputsRejectsUnknownInstallFrom() {
+  const step = validationStep();
+  assert.ok(step, "action.yml must retain the Validate inputs step");
+  const fixture = makeFixture();
+  try {
+    const result = runStep(step, inputValues({ ocr_install_from: "bogus" }), fixture);
+    assert.notStrictEqual(result.status, 0, "an unknown install source must fail validation");
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /::error::ocr_install_from must be one of: npm, source, release/,
+      "the failure must name every supported install source"
+    );
+  } finally {
+    removeFixture(fixture);
+  }
+}
+
 function testInstallRejectsStreamProgressBelowV198() {
   const install = installStep();
   assert.ok(install, "action.yml must retain the Install OpenCodeReview step");
@@ -1505,7 +1686,7 @@ function testRequiredStepTopologyAndEnvironmentContracts() {
       "LLM_REASONING_EFFORT_INPUT",
       "STREAM_PROGRESS_INPUT",
     ],
-    "Install OpenCodeReview": ["OCR_VERSION"],
+    "Install OpenCodeReview": ["OCR_VERSION", "OCR_RELEASE_REPO", "OCR_RELEASE_TAG"],
     "Configure OCR": [
       "OCR_LLM_URL",
       "OCR_LLM_MODEL",
@@ -1621,6 +1802,10 @@ const TESTS = [
   ["Run OpenCodeReview retains the extra-headers env override", testRunRetainsExtraHeadersEnvironmentOverride],
   ["Run OpenCodeReview fails closed without validated task timeout", testRunFailsClosedWhenValidatedTaskTimeoutIsMissing],
   ["the official OpenCodeReview NPM install is preserved", testOfficialNpmPackageInstallIsPreserved],
+  ["Install OpenCodeReview downloads the per-commit rolling release binary", testInstallReleaseDownloadsPerCommitBinary],
+  ["Install OpenCodeReview refuses a release binary on checksum mismatch", testInstallReleaseRefusesChecksumMismatch],
+  ["Install OpenCodeReview fails closed on a missing release asset", testInstallReleaseFailsClosedOnMissingAsset],
+  ["Validate inputs rejects an unknown install source", testValidateInputsRejectsUnknownInstallFrom],
   ["Install OpenCodeReview enforces the auth_token_cmd version floor", testInstallEnforcesAuthTokenCommandVersionFloor],
   ["Install OpenCodeReview rejects the effort input below v1.10.0", testInstallRejectsEffortBelowV1100],
   ["Install OpenCodeReview rejects stream_progress below v1.9.8", testInstallRejectsStreamProgressBelowV198],
