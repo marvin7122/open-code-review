@@ -16,7 +16,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -2258,6 +2258,11 @@ async function main() {
   testNewCommentIdFormat();
   // Batching (issue #479) — pure helpers
   testResolveBatchSize();
+  // Salvage: interrupted runs post session-manifest findings
+  testParseSessionIdFromStderr();
+  testLoadSalvagedSessionComments();
+  await testSalvagedPartialResultsPosted();
+  await testNoSalvageKeepsErrorSummary();
   testChunkArray();
   testSortToSendDeterministically();
   // Batching (issue #479) — integration via mock
@@ -5164,6 +5169,156 @@ function testTailForCommentKeepsTheTail() {
   assert.ok(!out.includes("HEAD-LINE"), "the head must be truncated away");
   assert.match(out, /earlier characters truncated; see the ocr-stderr\.log artifact/, "truncation must be announced");
   assert.ok(out.length <= MAX_COMMENT_STDERR_CHARS + 200, "the result stays far below GitHub's comment limit");
+}
+
+// Salvage: a run killed (timeout/cancel) before emitting its result JSON
+// leaves per-group findings in the session manifest. The poster must publish
+// them instead of losing the whole run.
+function testParseSessionIdFromStderr() {
+  assert.strictEqual(parseSessionIdFromStderr("[ocr] Session: abc123\nfoo"), "abc123", "plain id");
+  assert.strictEqual(
+    parseSessionIdFromStderr("a\n[ocr] Session: first\n[ocr] Session: second\n"),
+    "second",
+    "last id wins"
+  );
+  assert.strictEqual(parseSessionIdFromStderr("no session here"), "", "absent id");
+  assert.strictEqual(parseSessionIdFromStderr(""), "", "empty stderr");
+  assert.strictEqual(parseSessionIdFromStderr(null), "", "null stderr");
+}
+
+function salvageFixtureFs(sessionFiles) {
+  return {
+    readFileSync(file) {
+      if (file === "/tmp/ocr-result.json") throw new Error("ENOENT: killed run has no result");
+      if (file === "/tmp/ocr-stderr.log") return "[ocr] Plan completed\n[ocr] Session: sess-1\n";
+      const prefix = path.join("/home/test", ".opencodereview", "sessions") + path.sep;
+      if (file.startsWith(prefix)) {
+        const rel = file.slice(prefix.length);
+        if (Object.prototype.hasOwnProperty.call(sessionFiles, rel)) return sessionFiles[rel];
+        throw new Error(`ENOENT ${file}`);
+      }
+      throw new Error(`unexpected read: ${file}`);
+    },
+    readdirSync(dir) {
+      if (dir === path.join("/home/test", ".opencodereview", "sessions")) {
+        const entries = new Set();
+        for (const k of Object.keys(sessionFiles)) entries.add(k.split(path.sep)[0]);
+        return [...entries];
+      }
+      throw new Error(`unexpected readdir: ${dir}`);
+    },
+  };
+}
+
+function testLoadSalvagedSessionComments() {
+  const sessionFile = [
+    JSON.stringify({
+      type: "review_item_done",
+      sessionId: "sess-1",
+      filePath: "a.cpp",
+      comments: [{ path: "a.cpp", content: "done finding", start_line: 3, end_line: 3 }],
+    }),
+    JSON.stringify({ type: "review_item_failed", sessionId: "sess-1", filePath: "b.cpp", error: "boom" }),
+    JSON.stringify({
+      type: "review_item_reused",
+      sessionId: "sess-1",
+      filePath: "c.cpp",
+      comments: [{ path: "c.cpp", content: "already posted by parent", start_line: 1, end_line: 1 }],
+    }),
+    JSON.stringify({
+      type: "review_item_done",
+      sessionId: "other",
+      filePath: "d.cpp",
+      comments: [{ path: "d.cpp", content: "wrong session", start_line: 1, end_line: 1 }],
+    }),
+    "not json",
+    "",
+  ].join("\n");
+  const fs = salvageFixtureFs({ [path.join("repo-enc", "sess-1.jsonl")]: sessionFile });
+  const got = loadSalvagedSessionComments({
+    fs,
+    home: "/home/test",
+    stderrText: "[ocr] some line\n[ocr] Session: sess-1\n",
+  });
+  assert.strictEqual(got.length, 1, "only fresh done-items of this session");
+  assert.strictEqual(got[0].content, "done finding");
+  assert.deepStrictEqual(loadSalvagedSessionComments({ fs, home: "/home/test", stderrText: "nothing" }), [], "no id");
+  assert.deepStrictEqual(loadSalvagedSessionComments({ fs, home: "", stderrText: "[ocr] Session: sess-1" }), [], "no home");
+}
+
+async function testSalvagedPartialResultsPosted() {
+  const oldHome = process.env.HOME;
+  process.env.HOME = "/home/test";
+  try {
+    const sessionFile = [
+      JSON.stringify({
+        type: "review_item_done",
+        sessionId: "sess-9",
+        filePath: "src/a.cpp",
+        comments: [
+          { path: "src/a.cpp", content: "salvaged inline finding", start_line: 12, end_line: 12 },
+          { path: "src/b.cpp", content: "salvaged summary finding", start_line: 0, end_line: 0 },
+        ],
+      }),
+    ].join("\n");
+    const fs = salvageFixtureFs({ [path.join("repo-enc", "sess-9.jsonl")]: sessionFile });
+    // NOTE: the stderr embedded in salvageFixtureFs names sess-1; override it here.
+    fs.readFileSync = ((orig) => (file) => {
+      if (file === "/tmp/ocr-stderr.log") return "[ocr] Plan completed\n[ocr] Session: sess-9\n";
+      return orig(file);
+    })(fs.readFileSync);
+    const github = makeGithub({});
+    const core = mockCore();
+    await runPostReviewComments({
+      github,
+      context,
+      core,
+      fs,
+      resultPath: "/tmp/ocr-result.json",
+      stderrPath: "/tmp/ocr-stderr.log",
+      stickySummary: true,
+      incremental: false,
+    });
+    const inlinePosted = github.createReviewCalls.flatMap((c) => c.comments || []);
+    assert.ok(
+      inlinePosted.some((c) => c.path === "src/a.cpp" && (c.line === 12 || c.end_line === 12)),
+      "salvaged inline comment posted"
+    );
+    const summaryBody = (github.updatedComments[0] && github.updatedComments[0].body) || "";
+    assert.match(summaryBody, /salvaged summary finding/, "line-less finding rendered in summary");
+    assert.match(summaryBody, /Partial results/, "partial banner present");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+}
+
+async function testNoSalvageKeepsErrorSummary() {
+  const fs = {
+    readFileSync(file) {
+      if (file === "/tmp/ocr-result.json") throw new Error("ENOENT");
+      if (file === "/tmp/ocr-stderr.log") return "some progress\nboom";
+      throw new Error(`unexpected read: ${file}`);
+    },
+    readdirSync() {
+      throw new Error("ENOENT sessions");
+    },
+  };
+  const github = makeGithub({});
+  const core = mockCore();
+  await runPostReviewComments({
+    github,
+    context,
+    core,
+    fs,
+    resultPath: "/tmp/ocr-result.json",
+    stderrPath: "/tmp/ocr-stderr.log",
+    stickySummary: true,
+    incremental: false,
+  });
+  assert.strictEqual(github.createReviewCalls.length, 0, "no review posted without salvageable findings");
+  const bodies = [...github.issueComments.map((c) => c.body), ...github.updatedComments.map((c) => c.body)].join("\n");
+  assert.match(bodies, /encountered an error/, "error summary preserved");
 }
 
 main().catch((err) => {

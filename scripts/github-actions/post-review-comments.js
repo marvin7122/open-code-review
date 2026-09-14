@@ -12,10 +12,11 @@
 //
 // Dependencies are injected by the caller (actions/github-script provides
 // `github`/`context`/`core`; `fs` is required by the caller). The module has
-// no external (npm) requires — only the Node.js built-in `crypto` — which
-// keeps it runnable inside actions/github-script without bundling.
+// no external (npm) requires — only Node.js built-ins (`crypto`, `path`) —
+// which keeps it runnable inside actions/github-script without bundling.
 
 const crypto = require("crypto");
+const path = require("path");
 
 const SUMMARY_MARKER = "<!-- ocr-summary -->";
 
@@ -219,27 +220,43 @@ async function runPostReviewComments({
 
   // Read OCR output.
   let result;
+  let salvagedPartial = false;
   try {
     const raw = fs.readFileSync(resultPath, "utf8");
     result = JSON.parse(raw);
+    if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("empty result");
   } catch (e) {
     log(`Failed to parse OCR output: ${e.message}`);
-    // stream_progress streams human-audience progress into stderr, so the file
-    // can dwarf GitHub's 65536-char comment limit; keep the tail, which is
-    // where the error that killed the run was written.
-    const stderr = tailForComment(safeRead(fs, stderrPath).trim());
-    if (stderr) {
-      // No manifest exists on this path (the output could not be parsed), so it
-      // can only ever carry the previous checkpoint forward — never advance it.
-      const body = appendCheckpoint(
-        `${SUMMARY_MARKER}\n⚠️ **OpenCodeReview** encountered an error:\n${fencedBlock(stderr)}`,
-        null
-      );
-      const posted = await postSummary({ github, owner, repo, prNumber, body, sticky: stickySummary, preserveMarker, log });
-      stats.summaryUrl = posted.url;
+    // The review process may have been killed (timeout/cancel) after
+    // completing some groups: salvage their incrementally persisted findings
+    // instead of losing the whole run.
+    const salvaged = loadSalvagedSessionComments({
+      fs,
+      home: (typeof process !== "undefined" && process.env && process.env.HOME) || "",
+      stderrText: safeRead(fs, stderrPath),
+    });
+    if (salvaged.length > 0) {
+      log(`Salvaged ${salvaged.length} comment(s) from the interrupted run's session manifest.`);
+      result = { comments: salvaged, warnings: [], manifest: null };
+      salvagedPartial = true;
+    } else {
+      // stream_progress streams human-audience progress into stderr, so the file
+      // can dwarf GitHub's 65536-char comment limit; keep the tail, which is
+      // where the error that killed the run was written.
+      const stderr = tailForComment(safeRead(fs, stderrPath).trim());
+      if (stderr) {
+        // No manifest exists on this path (the output could not be parsed), so it
+        // can only ever carry the previous checkpoint forward — never advance it.
+        const body = appendCheckpoint(
+          `${SUMMARY_MARKER}\n⚠️ **OpenCodeReview** encountered an error:\n${fencedBlock(stderr)}`,
+          null
+        );
+        const posted = await postSummary({ github, owner, repo, prNumber, body, sticky: stickySummary, preserveMarker, log });
+        stats.summaryUrl = posted.url;
+      }
+      setStatsOutputs(out, stats);
+      return;
     }
-    setStatsOutputs(out, stats);
-    return;
   }
 
   const comments = result.comments || [];
@@ -430,6 +447,9 @@ async function runPostReviewComments({
     failed: failedCount,
     warnings,
   });
+  if (salvagedPartial) {
+    summaryBody = `⚠️ Partial results — the review run was interrupted before completion; findings below cover only the files finished in time.\n\n${summaryBody}`;
+  }
   summaryBody += formatSummaryComments(commentsWithoutLine);
   summaryBody += formatSummaryComments(commentsRouted);
   for (const { comment, error } of failedComments) {
@@ -1832,6 +1852,54 @@ function safeRead(fs, p) {
   }
 }
 
+// Session-manifest salvage for interrupted runs. The Go review process
+// persists per-file findings incrementally under
+// $HOME/.opencodereview/sessions/<repo>/<session-id>.jsonl and logs
+// "[ocr] Session: <id>" on stderr before starting. When the final result
+// JSON is missing (timeout/cancel SIGKILL), those findings would otherwise
+// die with the process.
+function parseSessionIdFromStderr(stderrText) {
+  const hits = String(stderrText || "").match(/\[ocr\] Session: (\S+)/g);
+  if (!hits || hits.length === 0) return "";
+  const m = hits[hits.length - 1].match(/\[ocr\] Session: (\S+)/);
+  return m ? m[1] : "";
+}
+
+function loadSalvagedSessionComments({ fs, home, stderrText }) {
+  const sessionId = parseSessionIdFromStderr(stderrText);
+  if (!sessionId || !home) return [];
+  let entries;
+  try {
+    entries = fs.readdirSync(path.join(home, ".opencodereview", "sessions"));
+  } catch (_) {
+    return [];
+  }
+  const salvaged = [];
+  for (const entry of entries || []) {
+    let raw;
+    try {
+      raw = fs.readFileSync(path.join(home, ".opencodereview", "sessions", entry, `${sessionId}.jsonl`), "utf8");
+    } catch (_) {
+      continue;
+    }
+    for (const line of String(raw).split("\n")) {
+      if (!line.trim()) continue;
+      let rec;
+      try {
+        rec = JSON.parse(line);
+      } catch (_) {
+        continue;
+      }
+      if (!rec || rec.sessionId !== sessionId) continue;
+      // Only fresh findings of this run: reused items were already posted by
+      // the parent run and would duplicate under a new run tag.
+      if (rec.type !== "review_item_done" || !Array.isArray(rec.comments)) continue;
+      for (const c of rec.comments) salvaged.push(c);
+    }
+  }
+  return salvaged;
+}
+
 // Rate-limit cooldown + idempotency reconciliation for a FAILED batch
 // createReview. Shared by the primary batch and the 422 secondary filtered
 // batch so the two can never drift apart.
@@ -2625,6 +2693,8 @@ module.exports = {
   fencedBlock,
   safeFence,
   tailForComment,
+  parseSessionIdFromStderr,
+  loadSalvagedSessionComments,
   MAX_COMMENT_STDERR_CHARS,
   SUMMARY_MARKER,
   NO_LINE_REASON,
