@@ -19,16 +19,16 @@ concurrency:
 
 jobs:
   build:
-    runs-on: self-hosted
+    # GitHub-hosted: this fork has no self-hosted runners, and the build
+    # needs nothing from the self-hosted fleet.
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    container:
-      image: golang:1.26.6
-      options: --cpus=2
     steps:
       - uses: actions/checkout@v7
 
-      - name: Trust workspace
-        run: git config --global --replace-all safe.directory '*'
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.6'
 
       - name: Build linux-x64 binary for this commit
         run: |
@@ -47,10 +47,9 @@ jobs:
 
   publish:
     needs: build
-    runs-on: self-hosted
+    # GitHub-hosted, same reason as the build job above.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
-    container:
-      image: ubuntu:24.04
     steps:
       - name: Install tools
         run: apt-get update && apt-get install -y git curl jq
