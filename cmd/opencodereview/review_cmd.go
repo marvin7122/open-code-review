@@ -243,6 +243,11 @@ func executeReviewContext(ctx context.Context, opts reviewOptions) (retErr error
 		RuntimeConfig:         rt.RuntimeConfig,
 	})
 
+	// Record the session ID before the run starts so post-processing can
+	// locate the incrementally persisted session manifest even when the run
+	// is interrupted (timeout/cancel) before emitting its result JSON.
+	logSessionIDForSalvage(os.Stderr, ag.SessionID())
+
 	closeRaw := bindRawWriter(rt.RawHolder, cc.RepoDir, ag.Session())
 	defer closeRaw()
 
@@ -322,6 +327,16 @@ func executeReviewContext(ctx context.Context, opts reviewOptions) (retErr error
 		return errors.Join(resultErr, emitErr)
 	}
 	return emitErr
+}
+
+// logSessionIDForSalvage records the session ID for post-run salvage. Empty
+// IDs (session persistence unavailable) are silently skipped so callers do
+// not advertise a retry target that does not exist.
+func logSessionIDForSalvage(w io.Writer, id string) {
+	if id == "" {
+		return
+	}
+	fmt.Fprintf(w, "[ocr] Session: %s\n", id)
 }
 
 func reviewResultError(runErr error, manifest *session.RunManifest) error {

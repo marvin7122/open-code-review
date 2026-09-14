@@ -953,7 +953,11 @@ runs:
         exit "${OCR_EXIT_CODE}"
 
     - name: Post review comments
-      if: env.OCR_EXIT_CODE == '0'
+      # Always runs: on an interrupted run (timeout/cancel) the result JSON is
+      # empty, but per-group findings survive in the session manifest and the
+      # poster salvages them. With nothing salvageable it falls back to the
+      # error summary (or stays silent with empty stderr).
+      if: always()
       id: post
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
