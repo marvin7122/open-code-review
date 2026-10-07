@@ -569,9 +569,15 @@ func (c *composedResolver) ResolveDetail(path string) RuleDetail {
 }
 
 // ResolveAllProjectRules returns every matching project rule in declaration
-// order. Custom and global rules are deliberately excluded: fan-out is an
-// opt-in project-rule feature, not a second interpretation of layer priority.
+// order. Global rules stay excluded: fan-out is an opt-in project-rule
+// feature, not a second interpretation of layer priority. An explicit
+// --rule file takes precedence when it matches the path, so callers can
+// partition the rule set (e.g. one chunk per parallel leg); paths it does
+// not cover fall back to the project layer.
 func (c *composedResolver) ResolveAllProjectRules(path string) []RuleDetail {
+	if details := c.matchProjectRuleDetails(c.custom, path, "custom"); len(details) > 0 {
+		return details
+	}
 	return c.matchProjectRuleDetails(c.project, path, "project")
 }
 

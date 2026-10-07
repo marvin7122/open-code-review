@@ -55,6 +55,42 @@ func TestValidateRuleTriggers(t *testing.T) {
 	}
 }
 
+// TestResolveAllProjectRulesPrefersCustom ensures an explicit --rule file
+// partitions fan-out: matching paths resolve from the custom layer only,
+// paths it does not cover fall back to the project layer, and a nil custom
+// layer preserves the legacy project-only behavior.
+func TestResolveAllProjectRulesPrefersCustom(t *testing.T) {
+	newResolver := func() *composedResolver {
+		return &composedResolver{
+			custom: &ProjectRule{Rules: []ProjectRuleEntry{
+				{Path: "src/chunk/**", Rule: "chunk-rule"},
+			}},
+			project: &ProjectRule{Rules: []ProjectRuleEntry{
+				{Path: "**/*.cpp", Rule: "project-rule"},
+			}},
+			system: &SystemRule{DefaultRule: "system"},
+		}
+	}
+	got := newResolver().ResolveAllProjectRules("src/chunk/a.cpp")
+	if len(got) != 1 || got[0].Rule != "chunk-rule" || got[0].Source != "custom" {
+		t.Fatalf("custom match = %+v, want single custom chunk-rule", got)
+	}
+	got = newResolver().ResolveAllProjectRules("src/other/b.cpp")
+	if len(got) != 1 || got[0].Rule != "project-rule" || got[0].Source != "project" {
+		t.Fatalf("fallback match = %+v, want single project project-rule", got)
+	}
+	legacy := &composedResolver{
+		project: &ProjectRule{Rules: []ProjectRuleEntry{
+			{Path: "**/*.cpp", Rule: "project-rule"},
+		}},
+		system: &SystemRule{DefaultRule: "system"},
+	}
+	got = legacy.ResolveAllProjectRules("src/other/b.cpp")
+	if len(got) != 1 || got[0].Source != "project" {
+		t.Fatalf("nil-custom match = %+v, want single project detail", got)
+	}
+}
+
 // TestResolveAllProjectRulesCarriesTriggers ensures the fan-out gate sees the
 // entry triggers on the resolved details.
 func TestResolveAllProjectRulesCarriesTriggers(t *testing.T) {
