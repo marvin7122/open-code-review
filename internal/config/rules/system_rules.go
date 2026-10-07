@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -129,6 +130,10 @@ type RuleDetail struct {
 	Rule    string // rule text
 	Source  string // "custom" | "project" | "global" | "system"
 	Pattern string // glob pattern that matched, or "default" for fallback — always a plain glob, never annotated
+	// Trigger holds the entry's content preconditions, if any: RE2 regexes of
+	// which at least one must match the file diff or new content for the
+	// rule's review task to be created. Empty means the rule always runs.
+	Trigger []string `json:"trigger,omitempty"`
 	// SniffedAs is "" for a plain path match, or the sniffed language (e.g.
 	// "objc") when content sniffing overrode the path-based rule. Internal
 	// only: callers that serialize RuleDetail (e.g. delegateRuleGroupJSON)
@@ -140,6 +145,13 @@ type RuleDetail struct {
 // DetailResolver extends Resolver with source metadata.
 type DetailResolver interface {
 	ResolveDetail(path string) RuleDetail
+}
+
+// ProjectRuleResolver exposes every matching rule from the project layer. The
+// declaration order is significant for callers that opt into per-rule review;
+// Resolve remains the legacy first-match API.
+type ProjectRuleResolver interface {
+	ResolveAllProjectRules(path string) []RuleDetail
 }
 
 // Resolve returns the rule text for a given file path.
@@ -207,6 +219,14 @@ type ProjectRuleEntry struct {
 	Path            string `json:"path"`
 	Rule            string `json:"rule"`
 	MergeSystemRule bool   `json:"merge_system_rule,omitempty"`
+	// Trigger lists optional RE2 regexes naming constructs the rule reasons
+	// about (e.g. ["string_view", "span"]). In per-rule fan-out, the rule's
+	// review task for a file is skipped unless at least one trigger matches
+	// the file's diff or new content — a construct absent from both cannot
+	// produce a finding on this file. Entries without triggers always run.
+	// Rules about absence (missing headers, missing checks) must omit
+	// triggers.
+	Trigger []string `json:"trigger,omitempty"`
 }
 
 // ProjectRule holds rules loaded from <repoDir>/.opencodereview/rule.json.
@@ -385,8 +405,25 @@ func loadGlobalRule() (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal global rule: %w", err)
 	}
+	if err := validateRuleTriggers(pr.Rules); err != nil {
+		return nil, fmt.Errorf("invalid global rule triggers: %w", err)
+	}
 	resolveRuleEntries(pr.Rules, filepath.Dir(path), "")
 	return &pr, nil
+}
+
+// validateRuleTriggers rejects malformed trigger regexes at load time so a
+// typo cannot silently disable the fan-out gate (an uncompilable trigger
+// would otherwise fail open at group creation).
+func validateRuleTriggers(entries []ProjectRuleEntry) error {
+	for i := range entries {
+		for _, pattern := range entries[i].Trigger {
+			if _, err := regexp.Compile(pattern); err != nil {
+				return fmt.Errorf("rule %d trigger %q: %w", i, pattern, err)
+			}
+		}
+	}
+	return nil
 }
 
 func loadRuleFile(path string) (*ProjectRule, error) {
@@ -397,6 +434,9 @@ func loadRuleFile(path string) (*ProjectRule, error) {
 	var pr ProjectRule
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal rule file %s: %w", path, err)
+	}
+	if err := validateRuleTriggers(pr.Rules); err != nil {
+		return nil, fmt.Errorf("invalid rule file %s triggers: %w", path, err)
 	}
 	resolveRuleEntries(pr.Rules, filepath.Dir(path), "")
 	return &pr, nil
@@ -437,6 +477,9 @@ func loadProjectRule(repoDir string) (*ProjectRule, error) {
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return nil, fmt.Errorf("unmarshal project rule: %w", err)
 	}
+	if err := validateRuleTriggers(pr.Rules); err != nil {
+		return nil, fmt.Errorf("invalid project rule triggers: %w", err)
+	}
 	resolveRuleEntries(pr.Rules, repoDir, confineRoot)
 	return &pr, nil
 }
@@ -475,6 +518,11 @@ func (c *composedResolver) CanonicalConfig() []string {
 				merge = "1"
 			}
 			fields = append(fields, "layer", name, "path", e.Path, "rule", e.Rule, "merge", merge)
+			// Triggers change which review tasks exist, so they participate
+			// in the manifest hash like rule text does.
+			for _, trigger := range e.Trigger {
+				fields = append(fields, "trigger", trigger)
+			}
 		}
 	}
 	appendLayer("custom", c.custom)
@@ -518,6 +566,48 @@ func (c *composedResolver) ResolveDetail(path string) RuleDetail {
 		return *detail
 	}
 	return c.system.resolveDetail(path)
+}
+
+// ResolveAllProjectRules returns every matching project rule in declaration
+// order. Global rules stay excluded: fan-out is an opt-in project-rule
+// feature, not a second interpretation of layer priority. An explicit
+// --rule file takes precedence when it matches the path, so callers can
+// partition the rule set (e.g. one chunk per parallel leg); paths it does
+// not cover fall back to the project layer.
+func (c *composedResolver) ResolveAllProjectRules(path string) []RuleDetail {
+	if details := c.matchProjectRuleDetails(c.custom, path, "custom"); len(details) > 0 {
+		return details
+	}
+	return c.matchProjectRuleDetails(c.project, path, "project")
+}
+
+func (c *composedResolver) matchProjectRuleDetails(pr *ProjectRule, path, source string) []RuleDetail {
+	if pr == nil {
+		return nil
+	}
+	var details []RuleDetail
+	for i := range pr.Rules {
+		entry := &pr.Rules[i]
+		if entry.Rule == "" && !entry.MergeSystemRule {
+			continue
+		}
+		matched := false
+		for _, pattern := range expandBraces(entry.Path) {
+			if ok, _ := doublestar.Match(strings.ToLower(pattern), strings.ToLower(path)); ok {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		rule := entry.Rule
+		if entry.MergeSystemRule {
+			rule = c.mergeWithSystemRule(path, rule)
+		}
+		details = append(details, RuleDetail{Rule: rule, Source: source, Pattern: entry.Path, Trigger: entry.Trigger})
+	}
+	return details
 }
 
 func (c *composedResolver) matchProjectRuleDetail(pr *ProjectRule, path, source string) *RuleDetail {

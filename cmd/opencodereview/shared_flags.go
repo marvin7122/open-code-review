@@ -216,6 +216,7 @@ func registerReviewFlags(cmd *cobra.Command, opts *reviewOptions) {
 	cmd.Flags().StringVar(&opts.effort, "effort", "", "review effort preset: low | medium | high (\"\" = configured or default medium)")
 	cmd.RegisterFlagCompletionFunc("effort", completeEnum(template.EffortNames()...))
 	cmd.Flags().BoolVar(&opts.noFilter, "no-filter", false, "keep all review comments without LLM post-filtering")
+	cmd.Flags().BoolVar(&opts.fanOutProjectRules, "fan-out-project-rules", false, "review once for every matching project rule")
 	addPreviewFlag(cmd, &opts.preview)
 }
 

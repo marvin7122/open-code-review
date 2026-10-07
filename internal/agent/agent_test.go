@@ -205,6 +205,30 @@ func TestParseFilterResponse(t *testing.T) {
 			wantSet: nil,
 		},
 		{
+			name:    "comment_ids object shape accepted",
+			raw:     `{"comment_ids": ["c-1", "c-2"]}`,
+			total:   5,
+			wantSet: map[int]struct{}{1: {}, 2: {}},
+		},
+		{
+			name:    "empty comment_ids object keeps everything",
+			raw:     `{"comment_ids": []}`,
+			total:   5,
+			wantSet: map[int]struct{}{},
+		},
+		{
+			name:    "analysis object without ids returns nil",
+			raw:     `{"analysis": ["c-0 looks wrong here"]}`,
+			total:   5,
+			wantSet: nil,
+		},
+		{
+			name:    "prose mentioning IDs never scraped",
+			raw:     `We found c-0 and c-2 wrong, the rest is fine.`,
+			total:   5,
+			wantSet: nil,
+		},
+		{
 			name:    "empty array",
 			raw:     `[]`,
 			total:   5,

@@ -423,7 +423,15 @@ func (r *Runner) RunMainTask(ctx context.Context, messages []llm.Message, taskKe
 		calls := resp.ToolCalls()
 
 		if len(calls) == 0 {
-			fmt.Fprintf(stdout.Writer(), "[ocr] No tool calls parsed for %s, retrying...\n", taskKey)
+			// Log what the model actually emitted (capped): with 27 such
+			// retries observed on a single PR, the next stderr must show
+			// whether models chat instead of acting or the provider mangles
+			// tool-call syntax — currently indistinguishable.
+			preview := content
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			fmt.Fprintf(stdout.Writer(), "[ocr] No tool calls parsed for %s, retrying... content=%q\n", taskKey, preview)
 			messages = append(messages, llm.NewTextMessage("user", "You did not successfully call any tools. Please try again or use task_done if finished."))
 			native := resp.Native()
 			reasoning := resp.ReasoningContent()

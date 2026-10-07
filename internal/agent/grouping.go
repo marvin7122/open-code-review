@@ -7,10 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/alibaba/open-code-review/internal/config/rules"
 	"github.com/alibaba/open-code-review/internal/config/template"
 	"github.com/alibaba/open-code-review/internal/llm"
 	"github.com/alibaba/open-code-review/internal/model"
@@ -28,14 +30,19 @@ const smallChangeSetLabel = "small change set"
 
 // FileGroup is a set of semantically related diffs to be reviewed in one LLM call.
 type FileGroup struct {
-	Label string
-	Diffs []model.Diff
+	Label        string
+	Diffs        []model.Diff
+	Rule         string
+	RuleIdentity string
+	TaskKey      string
 }
 
 // FileGroupInfo is the exported, JSON-friendly representation of a file group.
 type FileGroupInfo struct {
-	Label string   `json:"label"`
-	Files []string `json:"files"`
+	Label        string   `json:"label"`
+	Files        []string `json:"files"`
+	RuleIdentity string   `json:"rule_identity,omitempty"`
+	TaskKey      string   `json:"task_key,omitempty"`
 }
 
 type groupingResponse struct {
@@ -368,6 +375,76 @@ func fileGroupKey(diffs []model.Diff) string {
 	}
 	sort.Strings(paths)
 	return strings.Join(paths, ",")
+}
+
+func groupTaskKey(g FileGroup) string {
+	if g.TaskKey != "" {
+		return g.TaskKey
+	}
+	return fileGroupKey(g.Diffs)
+}
+
+// fanOutProjectRuleGroups bypasses semantic grouping and creates one task for
+// every matching project rule. Files with no project match retain one fallback
+// task using the legacy resolver behavior.
+func fanOutProjectRuleGroups(diffs []model.Diff, resolver rules.Resolver) []FileGroup {
+	all, ok := resolver.(rules.ProjectRuleResolver)
+	if !ok {
+		return toSingleFileGroups(diffs)
+	}
+	var groups []FileGroup
+	for _, d := range diffs {
+		matches := all.ResolveAllProjectRules(d.NewPath)
+		if len(matches) == 0 {
+			groups = append(groups, FileGroup{Label: d.NewPath, Diffs: []model.Diff{d}})
+			continue
+		}
+		for i, match := range matches {
+			identity := fmt.Sprintf("%s#%d", match.Pattern, i)
+			taskKey := d.NewPath + "::project-rule::" + identity
+			// Match against the diff and the full new content: a construct
+			// the rule reasons about (e.g. noexcept on a declaration) may
+			// live outside the changed hunks.
+			if !ruleTriggersHit(d.Diff+"\n"+d.NewFileContent, match.Trigger) {
+				fmt.Fprintf(stdout.Writer(), "[ocr] skipping group %q: no rule trigger match\n", taskKey)
+				continue
+			}
+			groups = append(groups, FileGroup{
+				Label:        d.NewPath + " [project rule " + identity + "]",
+				Diffs:        []model.Diff{d},
+				Rule:         match.Rule,
+				RuleIdentity: identity,
+				TaskKey:      taskKey,
+			})
+		}
+	}
+	return groups
+}
+
+// ruleTriggersHit reports whether a project rule's review task should be
+// created for a file. An empty trigger list always runs: the gate is
+// fail-open, and rules about absence (missing headers, missing checks) must
+// omit triggers. Otherwise at least one RE2 trigger must match the text
+// under review (the unified diff plus the full new file content, since a
+// construct the rule reasons about may live outside the changed hunks).
+// Matching is case-sensitive: code constructs are. An uncompilable pattern
+// fails open with a warning; triggers are validated at rule load, so this
+// only fires for programmatically built resolvers.
+func ruleTriggersHit(diffText string, triggers []string) bool {
+	if len(triggers) == 0 {
+		return true
+	}
+	for _, pattern := range triggers {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			fmt.Fprintf(stdout.Writer(), "[ocr] WARNING: ignoring invalid rule trigger %q: %v\n", pattern, err)
+			return true
+		}
+		if re.MatchString(diffText) {
+			return true
+		}
+	}
+	return false
 }
 
 func toSingleFileGroups(diffs []model.Diff) []FileGroup {
