@@ -806,6 +806,49 @@ func TestExecuteSubtask_WithPlanPhase(t *testing.T) {
 	}
 }
 
+// SkipPlan (--no-plan) skips the plan phase even when the template requires
+// it for every group, so the review makes only its main-loop call.
+func TestExecuteSubtask_SkipPlan(t *testing.T) {
+	tmpDir := t.TempDir()
+	sess := session.New(tmpDir, "main", "test", session.SessionOptions{ReviewMode: "diff"})
+
+	client := &fakeAgentClient{responses: []*llm.ChatResponse{agentTaskDoneResponse()}}
+	a := New(Args{
+		LLMClient: client,
+		Model:     "test",
+		Session:   sess,
+		Tools:     tool.NewRegistry(),
+		SkipPlan:  true,
+		Template: template.Template{
+			MaxTokens:             100000,
+			MaxToolRequestTimes:   10,
+			PlanModeLineThreshold: 0,
+			PlanTask: &template.LlmConversation{
+				Messages: []template.ChatMessage{{Role: "user", Content: "Plan for: {{diffs}}"}},
+			},
+			MainTask: template.LlmConversation{
+				Messages: []template.ChatMessage{{Role: "user", Content: "Review: {{diffs}}"}},
+			},
+		},
+		MainToolDefs: []llm.ToolDef{
+			{Type: "function", Function: llm.FunctionDef{Name: "task_done", Description: "done"}},
+		},
+	})
+	a.currentDate = "2025-06-26 10:00"
+	a.diffs = []model.Diff{{NewPath: "main.go", OldPath: "main.go", Diff: "+new code", Insertions: 5}}
+
+	completed, _, err := a.executeGroupSubtask(context.Background(), FileGroup{Label: "main.go", Diffs: a.diffs})
+	if err != nil {
+		t.Fatalf("executeGroupSubtask: %v", err)
+	}
+	if !completed {
+		t.Fatal("expected completed review")
+	}
+	if client.calls != 1 {
+		t.Fatalf("LLM calls = %d, want 1 (no plan call)", client.calls)
+	}
+}
+
 func TestExecuteSubtask_ContextCancelled(t *testing.T) {
 	tmpDir := t.TempDir()
 	sess := session.New(tmpDir, "main", "test", session.SessionOptions{ReviewMode: "diff"})

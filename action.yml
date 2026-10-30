@@ -91,6 +91,13 @@ inputs:
       includes that flag. Empty or false keeps first-match resolution.
     required: false
     default: 'false'
+  no_plan:
+    description: >-
+      When true, pass `--no-plan` so no review group runs the PLAN_TASK
+      pre-pass, which saves one LLM call (and its tool turns) per group.
+      Requires a source-built OCR binary that includes that flag.
+    required: false
+    default: 'false'
   ocr_install_from:
     description: >-
       How to install the OCR CLI. `npm` (default) installs
@@ -380,6 +387,7 @@ runs:
         LLM_REASONING_EFFORT_INPUT: ${{ inputs.llm_reasoning_effort }}
         STREAM_PROGRESS_INPUT: ${{ inputs.stream_progress }}
         FAN_OUT_INPUT: ${{ inputs.fan_out_project_rules }}
+        NO_PLAN_INPUT: ${{ inputs.no_plan }}
         INSTALL_FROM_INPUT: ${{ inputs.ocr_install_from }}
       shell: bash
       run: |
@@ -471,6 +479,17 @@ runs:
             ;;
         esac
         echo "FAN_OUT_PROJECT_RULES=$NORMALIZED_FAN_OUT" >> "$GITHUB_ENV"
+
+        NORMALIZED_NO_PLAN="$(printf '%s' "$NO_PLAN_INPUT" | tr '[:upper:]' '[:lower:]')"
+        case "$NORMALIZED_NO_PLAN" in
+          ""|false) NORMALIZED_NO_PLAN=false ;;
+          true) ;;
+          *)
+            echo "::error::no_plan must be one of: true, false (got '$NO_PLAN_INPUT')"
+            exit 1
+            ;;
+        esac
+        echo "NO_PLAN=$NORMALIZED_NO_PLAN" >> "$GITHUB_ENV"
 
         NORMALIZED_INSTALL_FROM="$(printf '%s' "$INSTALL_FROM_INPUT" | tr '[:upper:]' '[:lower:]')"
         case "$NORMALIZED_INSTALL_FROM" in
@@ -675,6 +694,7 @@ runs:
         # normalized into the environment, not the raw inputs.
         OCR_FP_EFFORT: ${{ env.EFFORT }}
         OCR_FP_FAN_OUT_PROJECT_RULES: ${{ env.FAN_OUT_PROJECT_RULES }}
+        OCR_FP_NO_PLAN: ${{ env.NO_PLAN }}
         OCR_FP_MAX_TOKENS_BUDGET: ${{ env.MAX_TOKENS_BUDGET }}
         # Extra headers can point the same `llm_model` string at a different
         # backend model or a different provider entirely, so they change what a
@@ -809,6 +829,7 @@ runs:
                 process.env.OCR_FP_LLM_TIMEOUT,
                 process.env.OCR_FP_EFFORT,
                 process.env.OCR_FP_FAN_OUT_PROJECT_RULES,
+                process.env.OCR_FP_NO_PLAN,
                 process.env.OCR_FP_MAX_TOKENS_BUDGET,
                 extraHeadersDigest,
                 process.env.OCR_FP_RULE,
@@ -886,6 +907,7 @@ runs:
         OCR_BACKGROUND: ${{ inputs.background }}
         OCR_RULE: ${{ inputs.rule }}
         FAN_OUT_PROJECT_RULES: ${{ env.FAN_OUT_PROJECT_RULES }}
+        NO_PLAN: ${{ env.NO_PLAN }}
         # Step output, not job env: empty when the resolve step was skipped or
         # chose the full range, and never inherited from an earlier use of this
         # action in the same job.
@@ -912,6 +934,7 @@ runs:
         [ -n "$OCR_BACKGROUND" ] && ARGS+=(--background "$OCR_BACKGROUND")
         [ -n "$OCR_RULE" ] && ARGS+=(--rule "$OCR_RULE")
         [ "${FAN_OUT_PROJECT_RULES:-false}" = "true" ] && ARGS+=(--fan-out-project-rules)
+        [ "${NO_PLAN:-false}" = "true" ] && ARGS+=(--no-plan)
         [ -n "${EFFORT:-}" ] && ARGS+=(--effort "$EFFORT")
         [ -n "${MAX_TOKENS_BUDGET:-}" ] && ARGS+=(--max-tokens-budget "$MAX_TOKENS_BUDGET")
         set +e

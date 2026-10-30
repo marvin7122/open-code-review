@@ -158,6 +158,10 @@ type Args struct {
 	// False preserves the legacy semantic grouping and first-match behavior.
 	FanOutProjectRules bool
 
+	// SkipPlan disables the PLAN_TASK pre-pass even when the template defines
+	// one and a group's churn exceeds the plan thresholds. Set via --no-plan.
+	SkipPlan bool
+
 	// RuntimeConfig carries the non-secret, allowlisted runtime settings that
 	// identify how this run was configured, for the manifest's
 	// runtime_config_sha256. It is populated by the cmd layer from the resolved
@@ -1442,7 +1446,7 @@ func (a *Agent) executeGroupSubtask(ctx context.Context, g FileGroup) (bool, *su
 	rule := a.resolveGroupRule(g)
 
 	// Phase 1: Plan (skip when changes are below threshold)
-	planEnabled := a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0
+	planEnabled := !a.args.SkipPlan && a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0
 	planRequired := a.args.Template.PlanRequired(len(g.Diffs), totalChanged, maxFileChanged)
 
 	var planResult string
