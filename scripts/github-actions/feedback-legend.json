@@ -1,0 +1,24 @@
+{
+  "_comment": "The one definition of the reviewer feedback on OpenCodeReview findings: the poster renders the legend under every finding from it, and marvin7122/ocr-runners feedback/collect.py and propose.py read reactions and reply keywords with it. Change meanings only here.",
+  "version": 2,
+  "reactions": [
+    { "content": "+1", "emoji": "👍", "key": "actionable", "meaning": "actionable" },
+    { "content": "heart", "emoji": "❤️", "key": "valuable", "meaning": "valuable" },
+    { "content": "rocket", "emoji": "🚀", "key": "fixed", "meaning": "fixed" },
+    { "content": "-1", "emoji": "👎", "key": "wrong", "meaning": "wrong" },
+    { "content": "eyes", "emoji": "👀", "key": "duplicate", "meaning": "duplicate" },
+    { "content": "confused", "emoji": "😕", "key": "confusing", "meaning": "confusing" },
+    { "content": "laugh", "emoji": "😄", "key": "too_long", "meaning": "too long, didn't read" },
+    { "content": "hooray", "emoji": "🎉", "key": "improvement_potential", "meaning": "improvement potential (right idea, the comment should be better)" }
+  ],
+  "legacy_reactions": [
+    { "content": "confused", "key": "not_actionable", "reason": "Version 1 of the legend defined 😕 as \"not actionable\". A 😕 made before the cut-over (the first commit of this file with version 2 on the default branch) keeps that meaning." }
+  ],
+  "keywords": [
+    { "keyword": "/not-actionable", "key": "not_actionable", "takes_text": false, "meaning": "correct, but not worth acting on" },
+    { "keyword": "/improve", "key": "improve", "takes_text": true, "meaning": "how this comment should be better" },
+    { "keyword": "/wrong", "key": "wrong", "takes_text": true, "meaning": "why it is wrong" }
+  ],
+  "useful": ["actionable", "valuable", "fixed"],
+  "wording": ["confusing", "too_long"]
+}
