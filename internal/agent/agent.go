@@ -1944,6 +1944,12 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	llmSpan.End()
 	rec.SetResponse(resp, duration)
 	a.runner.RecordUsage(resp.Usage)
+	if resp.Usage != nil {
+		// The filter's share of the run totals, so the cost of verifying the
+		// findings can be told apart from the cost of the review itself.
+		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter usage for group %q: prompt=%d cache_read=%d completion=%d\n",
+			groupKey, resp.Usage.PromptTokens, resp.Usage.CacheReadTokens, resp.Usage.CompletionTokens)
+	}
 
 	indices := parseFilterToolCalls(resp.ToolCalls(), len(candidates))
 	if indices == nil {

@@ -149,6 +149,13 @@ inputs:
       Maximum matches one code_search tool call returns (default 100).
     required: false
     default: ''
+  rule_cards:
+    description: >-
+      Path to a JSON object mapping rule ids to {"title", "url"}. A finding
+      whose text starts with a mapped rule id (e.g. "PP7: ...") gets a line
+      linking the rule's knowledge card. Empty adds no links.
+    required: false
+    default: ''
   stream_progress:
     description: >-
       Stream live [ocr] review progress to the workflow log (human audience
@@ -1038,6 +1045,7 @@ runs:
         OCR_RANGE_REASON: ${{ steps.range.outputs.range_reason }}
         OCR_BASE_REF: ${{ env.BASE_REF }}
         OCR_MERGE_BASE: ${{ env.MERGE_BASE }}
+        OCR_RULE_CARDS: ${{ inputs.rule_cards }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |

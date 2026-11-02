@@ -16,7 +16,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -2216,7 +2216,25 @@ async function testRoutedFindingsCarryNoIdempotencyId() {
   assert.doesNotMatch(body, /ocr-\d+-\d+-[a-f0-9]+/, "routed summary body carries no idempotency id");
 }
 
+// A finding that starts with a rule id links that rule's knowledge card.
+function testRuleCardLine() {
+  const cards = {
+    PP7: { title: "Weak test assertions", url: "https://example.org/pp7.md" },
+    "rule:includes": { title: "Includes", url: null },
+  };
+  assert.strictEqual(
+    buildRuleCardLine({ content: "PP7: Use EXPECT_THAT." }, cards),
+    "\n\nRule [PP7](https://example.org/pp7.md): Weak test assertions",
+  );
+  assert.ok(buildRuleCardLine({ content: "**PP7** use matchers" }, cards).includes("[PP7]"), "bold id");
+  assert.strictEqual(buildRuleCardLine({ content: "rule:includes: missing include" }, cards), "", "no URL, no line");
+  assert.strictEqual(buildRuleCardLine({ content: "QC99: unknown rule" }, cards), "", "unknown id");
+  assert.strictEqual(buildRuleCardLine({ content: "The four-iterator overload" }, cards), "", "no id");
+  assert.strictEqual(buildRuleCardLine({}, cards), "", "no content");
+}
+
 async function main() {
+  testRuleCardLine();
   await testFailedInlineCommentsAreSummarized();
   await testWarningsListedAfterSummaryComments();
   await testErrorCommentUsesSafeFence();

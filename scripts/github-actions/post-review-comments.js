@@ -1673,11 +1673,41 @@ function routeComment(comment, policy) {
 // present) on its own leading line AFTER the id comment, so the idempotency
 // regex (unanchored, scans the whole body) still matches and the badge renders
 // as the first visible line. The code suggestion block is appended if present.
+// Rule id -> { title, url } from the JSON file named by OCR_RULE_CARDS (the
+// `rule_cards` action input), loaded once; {} when unset or unreadable.
+let ruleCardsCache;
+function loadRuleCards() {
+  if (ruleCardsCache !== undefined) return ruleCardsCache;
+  ruleCardsCache = {};
+  const file = process.env.OCR_RULE_CARDS;
+  if (!file) return ruleCardsCache;
+  try {
+    const parsed = JSON.parse(require("fs").readFileSync(file, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ruleCardsCache = parsed;
+  } catch (e) {
+    console.log(`::warning::Ignoring rule cards ${file}: ${e.message}`);
+  }
+  return ruleCardsCache;
+}
+
+// A finding of a project rule starts with the rule's id (e.g. "PP7: ...").
+// When that id has a knowledge card, return a trailing line linking it:
+// "Rule [PP7](<url>): <title>". Otherwise "".
+function buildRuleCardLine(comment, cards = loadRuleCards()) {
+  const match = /^\s*\**`?((?:[A-Z]{2,4}\d+[a-z]?)|(?:rule:[a-z-]+))`?\**(?=[:\s,.)])/.exec(comment.content || "");
+  if (!match) return "";
+  const card = cards[match[1]];
+  if (!card || !card.url) return "";
+  const title = card.title ? `: ${card.title}` : "";
+  return `\n\nRule [${match[1]}](${card.url})${title}`;
+}
+
 function formatComment(comment, id) {
   let body = id ? `<!-- ${id} -->\n` : "";
   const badge = buildBadgeImage(comment);
   if (badge) body += `${badge}\n`;
   body += comment.content || "";
+  body += buildRuleCardLine(comment);
   if (comment.suggestion_code && comment.existing_code) {
     body += "\n\n**Suggestion:**\n";
     body += fencedBlock(comment.suggestion_code, "suggestion");
@@ -1702,6 +1732,7 @@ function formatCommentMarkdown(comment, error) {
     md += `⚠️ GitHub could not post this as an inline comment: ${error}\n\n`;
   }
   md += comment.content || "";
+  md += buildRuleCardLine(comment);
 
   if (comment.suggestion_code && comment.existing_code) {
     md += "\n\n<details><summary>💡 Suggested Change</summary>\n\n";
@@ -2684,6 +2715,7 @@ module.exports = {
   buildBadge,
   buildPolicy,
   routeComment,
+  buildRuleCardLine,
   formatComment,
   formatCommentMarkdown,
   buildSummaryBody,
