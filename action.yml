@@ -91,6 +91,13 @@ inputs:
       includes that flag. Empty or false keeps first-match resolution.
     required: false
     default: 'false'
+  no_plan:
+    description: >-
+      When true, pass `--no-plan` so no review group runs the PLAN_TASK
+      pre-pass, which saves one LLM call (and its tool turns) per group.
+      Requires a source-built OCR binary that includes that flag.
+    required: false
+    default: 'false'
   ocr_install_from:
     description: >-
       How to install the OCR CLI. `npm` (default) installs
@@ -112,6 +119,41 @@ inputs:
       integer; empty or 0 means unlimited. Once the cap is exceeded, dispatch
       stops, skipped files are reported as failed(budget), partial results
       are still published, and the review exits 0.
+    required: false
+    default: ''
+  max_tokens:
+    description: >-
+      Per-group prompt token ceiling passed to `ocr review --max-tokens`.
+      Conversation compression starts at 60 % of it, so a lower value keeps
+      the context that every turn re-sends smaller (cheaper reviews); files
+      whose diff alone exceeds 80 % of it are skipped. Empty keeps the
+      configured or template default.
+    required: false
+    default: ''
+  review_filter_llm_extra_body:
+    description: >-
+      JSON object whose fields replace llm_extra_body's fields for the review
+      filter (finding verification) requests only, e.g.
+      '{"thinking": {"type": "enabled"}}' to verify with thinking while the
+      review itself runs without it. Empty uses llm_extra_body for both.
+    required: false
+    default: ''
+  file_read_max_lines:
+    description: >-
+      Maximum lines one file_read tool call returns (default 500). Every
+      returned line is re-sent on each later turn of the conversation.
+    required: false
+    default: ''
+  code_search_max_count:
+    description: >-
+      Maximum matches one code_search tool call returns (default 100).
+    required: false
+    default: ''
+  rule_cards:
+    description: >-
+      Path to a JSON object mapping rule ids to {"title", "url"}. A finding
+      whose text starts with a mapped rule id (e.g. "PP7: ...") gets a line
+      linking the rule's knowledge card. Empty adds no links.
     required: false
     default: ''
   stream_progress:
@@ -380,6 +422,7 @@ runs:
         LLM_REASONING_EFFORT_INPUT: ${{ inputs.llm_reasoning_effort }}
         STREAM_PROGRESS_INPUT: ${{ inputs.stream_progress }}
         FAN_OUT_INPUT: ${{ inputs.fan_out_project_rules }}
+        NO_PLAN_INPUT: ${{ inputs.no_plan }}
         INSTALL_FROM_INPUT: ${{ inputs.ocr_install_from }}
       shell: bash
       run: |
@@ -471,6 +514,17 @@ runs:
             ;;
         esac
         echo "FAN_OUT_PROJECT_RULES=$NORMALIZED_FAN_OUT" >> "$GITHUB_ENV"
+
+        NORMALIZED_NO_PLAN="$(printf '%s' "$NO_PLAN_INPUT" | tr '[:upper:]' '[:lower:]')"
+        case "$NORMALIZED_NO_PLAN" in
+          ""|false) NORMALIZED_NO_PLAN=false ;;
+          true) ;;
+          *)
+            echo "::error::no_plan must be one of: true, false (got '$NO_PLAN_INPUT')"
+            exit 1
+            ;;
+        esac
+        echo "NO_PLAN=$NORMALIZED_NO_PLAN" >> "$GITHUB_ENV"
 
         NORMALIZED_INSTALL_FROM="$(printf '%s' "$INSTALL_FROM_INPUT" | tr '[:upper:]' '[:lower:]')"
         case "$NORMALIZED_INSTALL_FROM" in
@@ -675,6 +729,7 @@ runs:
         # normalized into the environment, not the raw inputs.
         OCR_FP_EFFORT: ${{ env.EFFORT }}
         OCR_FP_FAN_OUT_PROJECT_RULES: ${{ env.FAN_OUT_PROJECT_RULES }}
+        OCR_FP_NO_PLAN: ${{ env.NO_PLAN }}
         OCR_FP_MAX_TOKENS_BUDGET: ${{ env.MAX_TOKENS_BUDGET }}
         # Extra headers can point the same `llm_model` string at a different
         # backend model or a different provider entirely, so they change what a
@@ -809,6 +864,7 @@ runs:
                 process.env.OCR_FP_LLM_TIMEOUT,
                 process.env.OCR_FP_EFFORT,
                 process.env.OCR_FP_FAN_OUT_PROJECT_RULES,
+                process.env.OCR_FP_NO_PLAN,
                 process.env.OCR_FP_MAX_TOKENS_BUDGET,
                 extraHeadersDigest,
                 process.env.OCR_FP_RULE,
@@ -886,6 +942,11 @@ runs:
         OCR_BACKGROUND: ${{ inputs.background }}
         OCR_RULE: ${{ inputs.rule }}
         FAN_OUT_PROJECT_RULES: ${{ env.FAN_OUT_PROJECT_RULES }}
+        NO_PLAN: ${{ env.NO_PLAN }}
+        MAX_TOKENS_INPUT: ${{ inputs.max_tokens }}
+        OCR_REVIEW_FILTER_EXTRA_BODY: ${{ inputs.review_filter_llm_extra_body }}
+        OCR_FILE_READ_MAX_LINES: ${{ inputs.file_read_max_lines }}
+        OCR_CODE_SEARCH_MAX_COUNT: ${{ inputs.code_search_max_count }}
         # Step output, not job env: empty when the resolve step was skipped or
         # chose the full range, and never inherited from an earlier use of this
         # action in the same job.
@@ -912,8 +973,16 @@ runs:
         [ -n "$OCR_BACKGROUND" ] && ARGS+=(--background "$OCR_BACKGROUND")
         [ -n "$OCR_RULE" ] && ARGS+=(--rule "$OCR_RULE")
         [ "${FAN_OUT_PROJECT_RULES:-false}" = "true" ] && ARGS+=(--fan-out-project-rules)
+        [ "${NO_PLAN:-false}" = "true" ] && ARGS+=(--no-plan)
         [ -n "${EFFORT:-}" ] && ARGS+=(--effort "$EFFORT")
         [ -n "${MAX_TOKENS_BUDGET:-}" ] && ARGS+=(--max-tokens-budget "$MAX_TOKENS_BUDGET")
+        if [ -n "${MAX_TOKENS_INPUT:-}" ]; then
+          if [[ ! "$MAX_TOKENS_INPUT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::max_tokens must be a positive integer (got '$MAX_TOKENS_INPUT')"
+            exit 1
+          fi
+          ARGS+=(--max-tokens "$MAX_TOKENS_INPUT")
+        fi
         set +e
         if [ "${STREAM_PROGRESS:-false}" = "true" ]; then
           OCR_STDERR_FIFO="$(mktemp -u)"
@@ -976,6 +1045,7 @@ runs:
         OCR_RANGE_REASON: ${{ steps.range.outputs.range_reason }}
         OCR_BASE_REF: ${{ env.BASE_REF }}
         OCR_MERGE_BASE: ${{ env.MERGE_BASE }}
+        OCR_RULE_CARDS: ${{ inputs.rule_cards }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |

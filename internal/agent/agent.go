@@ -158,6 +158,10 @@ type Args struct {
 	// False preserves the legacy semantic grouping and first-match behavior.
 	FanOutProjectRules bool
 
+	// SkipPlan disables the PLAN_TASK pre-pass even when the template defines
+	// one and a group's churn exceeds the plan thresholds. Set via --no-plan.
+	SkipPlan bool
+
 	// RuntimeConfig carries the non-secret, allowlisted runtime settings that
 	// identify how this run was configured, for the manifest's
 	// runtime_config_sha256. It is populated by the cmd layer from the resolved
@@ -1442,7 +1446,7 @@ func (a *Agent) executeGroupSubtask(ctx context.Context, g FileGroup) (bool, *su
 	rule := a.resolveGroupRule(g)
 
 	// Phase 1: Plan (skip when changes are below threshold)
-	planEnabled := a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0
+	planEnabled := !a.args.SkipPlan && a.args.Template.PlanTask != nil && len(a.args.Template.PlanTask.Messages) > 0
 	planRequired := a.args.Template.PlanRequired(len(g.Diffs), totalChanged, maxFileChanged)
 
 	var planResult string
@@ -1913,6 +1917,7 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 		llm.SessionTaskKey(a.session.SessionID, string(session.ReviewFilterTask), groupKey))
 	startTime := time.Now()
 	reqCtx := llm.WithRequestMeta(ctx, a.newRequestMeta(groupKey, session.ReviewFilterTask, rec.RequestNo))
+	reqCtx = llm.WithExtraBodyOverride(reqCtx, reviewFilterExtraBody())
 
 	_, llmSpan := telemetry.StartLLMSpan(ctx, a.args.Model)
 	resp, err := a.args.LLMClient.CompletionsWithCtx(reqCtx, llm.ChatRequest{
@@ -1939,6 +1944,12 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	llmSpan.End()
 	rec.SetResponse(resp, duration)
 	a.runner.RecordUsage(resp.Usage)
+	if resp.Usage != nil {
+		// The filter's share of the run totals, so the cost of verifying the
+		// findings can be told apart from the cost of the review itself.
+		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter usage for group %q: prompt=%d cache_read=%d completion=%d\n",
+			groupKey, resp.Usage.PromptTokens, resp.Usage.CacheReadTokens, resp.Usage.CompletionTokens)
+	}
 
 	indices := parseFilterToolCalls(resp.ToolCalls(), len(candidates))
 	if indices == nil {
