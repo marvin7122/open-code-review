@@ -1690,20 +1690,47 @@ function loadRuleCards() {
   return ruleCardsCache;
 }
 
-// A finding of a project rule starts with the rule's id (e.g. "PP7: ...").
-// When that id has a knowledge card, return a trailing line linking it:
-// "Rule [PP7](<url>): <title>". Otherwise "".
-function buildRuleCardLine(comment, cards = loadRuleCards()) {
+// The rule id a finding of a project rule starts with (e.g. "PP7: ..."), or
+// null.
+function findingRuleId(comment) {
   const match = /^\s*\**`?((?:[A-Z]{2,4}\d+[a-z]?)|(?:rule:[a-z-]+))`?\**(?=[:\s,.)])/.exec(comment.content || "");
-  if (!match) return "";
-  const card = cards[match[1]];
+  return match ? match[1] : null;
+}
+
+// When the finding's rule has a knowledge card, return a trailing line
+// linking it: "Rule [PP7](<url>): <title>". Otherwise "".
+function buildRuleCardLine(comment, cards = loadRuleCards()) {
+  const ruleId = findingRuleId(comment);
+  const card = ruleId ? cards[ruleId] : null;
   if (!card || !card.url) return "";
   const title = card.title ? `: ${card.title}` : "";
-  return `\n\nRule [${match[1]}](${card.url})${title}`;
+  return `\n\nRule [${ruleId}](${card.url})${title}`;
+}
+
+// The reactions a reviewer can leave on a finding; a scheduled job collects
+// them per rule (OCR_FEEDBACK_LEGEND=true adds this line).
+const FEEDBACK_LEGEND = "React: 👍 actionable · ❤️ valuable · 🚀 fixed · 😕 not actionable · 👎 wrong · 👀 duplicate";
+
+// A hidden marker that attributes the finding for the feedback collection:
+// its rule id, the fan-out leg, the model and the rule-set version (from
+// OCR_FEEDBACK_LEG, OCR_FEEDBACK_MODEL, OCR_RULESET_VERSION). It is a line of
+// its own, after the comment id marker, so the idempotency match on the id is
+// unchanged. "" when none of the attributes is known.
+function buildFeedbackMeta(comment, env = process.env) {
+  const meta = {
+    rule: findingRuleId(comment),
+    leg: env.OCR_FEEDBACK_LEG || null,
+    model: env.OCR_FEEDBACK_MODEL || null,
+    ruleset: env.OCR_RULESET_VERSION || null,
+  };
+  if (!Object.values(meta).some((v) => v)) return "";
+  // `--` cannot end an HTML comment early inside the JSON.
+  return `<!-- ocr-meta ${JSON.stringify(meta).replace(/--/g, "-\\u002d")} -->\n`;
 }
 
 function formatComment(comment, id) {
   let body = id ? `<!-- ${id} -->\n` : "";
+  body += buildFeedbackMeta(comment);
   const badge = buildBadgeImage(comment);
   if (badge) body += `${badge}\n`;
   body += comment.content || "";
@@ -1712,6 +1739,7 @@ function formatComment(comment, id) {
     body += "\n\n**Suggestion:**\n";
     body += fencedBlock(comment.suggestion_code, "suggestion");
   }
+  if (process.env.OCR_FEEDBACK_LEGEND === "true") body += `\n\n${FEEDBACK_LEGEND}`;
   return body;
 }
 
@@ -2716,6 +2744,9 @@ module.exports = {
   buildPolicy,
   routeComment,
   buildRuleCardLine,
+  buildFeedbackMeta,
+  findingRuleId,
+  FEEDBACK_LEGEND,
   formatComment,
   formatCommentMarkdown,
   buildSummaryBody,

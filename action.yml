@@ -196,6 +196,21 @@ inputs:
       leaves its spend. Empty writes none; the usage is logged either way.
     required: false
     default: ''
+  feedback_legend:
+    description: >-
+      When true, each inline finding ends with the reaction legend
+      ("React: 👍 actionable · ❤️ valuable · 🚀 fixed · 😕 not actionable ·
+      👎 wrong · 👀 duplicate") for the feedback collection.
+    required: false
+    default: 'false'
+  feedback_leg:
+    description: Fan-out leg recorded in each finding's hidden ocr-meta marker.
+    required: false
+    default: ''
+  ruleset_version:
+    description: Rule-set version (e.g. a hash of the rule file) recorded in each finding's ocr-meta marker.
+    required: false
+    default: ''
   stream_progress:
     description: >-
       Stream live [ocr] review progress to the workflow log (human audience
@@ -1093,6 +1108,10 @@ runs:
         OCR_BASE_REF: ${{ env.BASE_REF }}
         OCR_MERGE_BASE: ${{ env.MERGE_BASE }}
         OCR_RULE_CARDS: ${{ inputs.rule_cards }}
+        OCR_FEEDBACK_LEGEND: ${{ inputs.feedback_legend }}
+        OCR_FEEDBACK_LEG: ${{ inputs.feedback_leg }}
+        OCR_FEEDBACK_MODEL: ${{ inputs.llm_model }}
+        OCR_RULESET_VERSION: ${{ inputs.ruleset_version }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |
