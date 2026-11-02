@@ -5,6 +5,7 @@ package model
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -159,6 +160,7 @@ func TestLlmComment_JSON(t *testing.T) {
 		StartLine:      10,
 		EndLine:        15,
 		Thinking:       "reasoning",
+		Changes:        []CodeChange{{Path: "b.go", StartLine: 10, EndLine: 11, Replacement: "x := 1\n"}},
 	}
 
 	data, err := json.Marshal(c)
@@ -171,7 +173,7 @@ func TestLlmComment_JSON(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if got != c {
+	if !reflect.DeepEqual(got, c) {
 		t.Errorf("roundtrip mismatch:\n  got  %+v\n  want %+v", got, c)
 	}
 }

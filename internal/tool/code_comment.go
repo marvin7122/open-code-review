@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/alibaba/open-code-review/internal/model"
@@ -153,6 +154,7 @@ func parseCommentsInner(args map[string]any, defaultPath string) ([]model.LlmCom
 		if cm.Path == "" {
 			cm.Path = defaultPath
 		}
+		cm.Changes = parseCodeChanges(obj["changes"], cm.Path)
 
 		if cm.Path == "" || cm.Content == "" {
 			continue
@@ -161,6 +163,59 @@ func parseCommentsInner(args map[string]any, defaultPath string) ([]model.LlmCom
 		comments = append(comments, cm)
 	}
 	return comments, repair, ""
+}
+
+// parseCodeChanges reads the comment's `changes`: replacement text for exact
+// line ranges. An entry without a valid range or a string replacement is
+// dropped; an entry without a path applies to the comment's file.
+func parseCodeChanges(raw any, defaultPath string) []model.CodeChange {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var changes []model.CodeChange
+	for _, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		replacement, ok := obj["replacement"].(string)
+		if !ok {
+			continue
+		}
+		start, okStart := lineNumber(obj["start_line"])
+		end, okEnd := lineNumber(obj["end_line"])
+		if !okStart || !okEnd || start < 1 || end < start {
+			continue
+		}
+		path, _ := obj["path"].(string)
+		if path = strings.TrimSpace(path); path == "" {
+			path = defaultPath
+		}
+		if path == "" {
+			continue
+		}
+		changes = append(changes, model.CodeChange{Path: path, StartLine: start, EndLine: end, Replacement: replacement})
+	}
+	return changes
+}
+
+// lineNumber reads a line number given as a JSON number or a numeric string.
+func lineNumber(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		if n != float64(int(n)) {
+			return 0, false
+		}
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return int(i), err == nil
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(n))
+		return i, err == nil
+	}
+	return 0, false
 }
 
 func normalizeCodeCommentCategory(category string) string {
