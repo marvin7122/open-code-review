@@ -211,6 +211,18 @@ inputs:
     description: Rule-set version (e.g. a hash of the rule file) recorded in each finding's ocr-meta marker.
     required: false
     default: ''
+  leg_rule_ids:
+    description: >-
+      The rule ids of this run (comma- or space-separated). Before posting,
+      each finding gets one of them: the code_comment rule_id, the id its
+      text starts with, an id its text mentions, else "unknown" (counted in
+      rule_stats_file). A finding with a known rule starts with "<id>: ".
+    required: false
+    default: ''
+  rule_stats_file:
+    description: Path of a JSON file {findings, unknown} written when leg_rule_ids is set.
+    required: false
+    default: ''
   stream_progress:
     description: >-
       Stream live [ocr] review progress to the workflow log (human audience
@@ -1112,6 +1124,8 @@ runs:
         OCR_FEEDBACK_LEG: ${{ inputs.feedback_leg }}
         OCR_FEEDBACK_MODEL: ${{ inputs.llm_model }}
         OCR_RULESET_VERSION: ${{ inputs.ruleset_version }}
+        OCR_LEG_RULE_IDS: ${{ inputs.leg_rule_ids }}
+        OCR_RULE_STATS_FILE: ${{ inputs.rule_stats_file }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |

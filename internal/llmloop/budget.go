@@ -131,6 +131,13 @@ func (r *Runner) reportUsage() {
 	}
 }
 
+// Truncated reports whether the hard budget has already cut the run short.
+// Unlike BudgetExhausted it never marks the run.
+func (r *Runner) Truncated() bool {
+	_, ok := r.truncation.Load().(string)
+	return ok
+}
+
 // BudgetExhausted reports whether the run has reached a hard limit. The first
 // time it has, the run is marked truncated (warning, usage file) with the
 // limit as the reason.

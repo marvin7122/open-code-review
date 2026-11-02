@@ -262,6 +262,8 @@ async function runPostReviewComments({
   const comments = result.comments || [];
   const warnings = result.warnings || [];
   stats.total = comments.length;
+  const ruleStats = assignFindingRules(comments, parseRuleIds(process.env.OCR_LEG_RULE_IDS));
+  writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, ruleStats, log);
 
   // No comments: post a "looks good" summary.
   if (comments.length === 0) {
@@ -1690,11 +1692,60 @@ function loadRuleCards() {
   return ruleCardsCache;
 }
 
-// The rule id a finding of a project rule starts with (e.g. "PP7: ..."), or
-// null.
+// Matches a rule id: CPP15, QC18b, rule:includes.
+const RULE_ID_PATTERN = "(?:[A-Z]{2,4}\\d+[a-z]?|rule:[a-z-]+)";
+
+// The rule id of a finding: the one assignFindingRules decided (comment.rule),
+// else the id its text starts with (e.g. "PP7: ..."), else null.
 function findingRuleId(comment) {
-  const match = /^\s*\**`?((?:[A-Z]{2,4}\d+[a-z]?)|(?:rule:[a-z-]+))`?\**(?=[:\s,.)])/.exec(comment.content || "");
+  if (comment.rule) return comment.rule === "unknown" ? null : comment.rule;
+  const match = new RegExp(`^\\s*\\**\`?(${RULE_ID_PATTERN})\`?\\**(?=[:\\s,.)])`).exec(comment.content || "");
   return match ? match[1] : null;
+}
+
+// The rule ids of this run (OCR_LEG_RULE_IDS, comma- or space-separated).
+function parseRuleIds(raw) {
+  return (raw || "").split(/[\s,]+/).filter(Boolean);
+}
+
+// Decide every finding's rule before posting, when the run's rule ids are
+// known: the rule_id the model gave in its code_comment call, if it is one of
+// them; else the id the text starts with; else one of them mentioned in the
+// text; else "unknown". A finding with a known rule starts with "<id>: ", so
+// its card link and its ocr-meta marker carry the rule. Without rule ids the
+// findings are left as they are. Returns {findings, unknown}.
+function assignFindingRules(comments, ruleIds) {
+  const stats = { findings: comments.length, unknown: 0 };
+  if (ruleIds.length === 0) return stats;
+  const known = new Set(ruleIds);
+  const leading = new RegExp(`^\\s*\\**\`?(${RULE_ID_PATTERN})\`?\\**(?=[:\\s,.)])`);
+  const anywhere = new RegExp(`(?<![A-Za-z0-9:])(${RULE_ID_PATTERN})(?![A-Za-z0-9-])`, "g");
+  for (const comment of comments) {
+    const content = comment.content || "";
+    const start = leading.exec(content);
+    let rule = null;
+    if (comment.rule_id && known.has(comment.rule_id)) rule = comment.rule_id;
+    else if (start && known.has(start[1])) rule = start[1];
+    else rule = [...content.matchAll(anywhere)].map((m) => m[1]).find((id) => known.has(id)) || null;
+    if (!rule) {
+      comment.rule = "unknown";
+      stats.unknown += 1;
+      continue;
+    }
+    comment.rule = rule;
+    if (!(start && start[1] === rule)) comment.content = `${rule}: ${content}`;
+  }
+  return stats;
+}
+
+// Write the rule statistics for the review's spend comment, if asked to.
+function writeRuleStats(fs, file, stats, log = console.log) {
+  if (!file) return;
+  try {
+    fs.writeFileSync(file, JSON.stringify(stats));
+  } catch (e) {
+    log(`::warning::Could not write rule stats ${file}: ${e.message}`);
+  }
 }
 
 // When the finding's rule has a knowledge card, return a trailing line
@@ -1718,7 +1769,7 @@ const FEEDBACK_LEGEND = "React: 👍 actionable · ❤️ valuable · 🚀 fixed
 // unchanged. "" when none of the attributes is known.
 function buildFeedbackMeta(comment, env = process.env) {
   const meta = {
-    rule: findingRuleId(comment),
+    rule: comment.rule === "unknown" ? "unknown" : findingRuleId(comment),
     leg: env.OCR_FEEDBACK_LEG || null,
     model: env.OCR_FEEDBACK_MODEL || null,
     ruleset: env.OCR_RULESET_VERSION || null,
@@ -2746,6 +2797,8 @@ module.exports = {
   buildRuleCardLine,
   buildFeedbackMeta,
   findingRuleId,
+  assignFindingRules,
+  parseRuleIds,
   FEEDBACK_LEGEND,
   formatComment,
   formatCommentMarkdown,

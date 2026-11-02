@@ -136,6 +136,23 @@ func TestParseComments_Fields(t *testing.T) {
 	}
 }
 
+// The rule id a comment names is kept (trimmed); without one it stays empty.
+func TestParseComments_RuleID(t *testing.T) {
+	args := map[string]any{
+		"comments": []any{
+			map[string]any{"content": "QC18: imprecise", "existing_code": "x", "path": "a.cpp", "rule_id": " QC18 "},
+			map[string]any{"content": "no rule", "existing_code": "y", "path": "a.cpp"},
+		},
+	}
+	comments, errMsg := ParseComments(args)
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	if len(comments) != 2 || comments[0].RuleID != "QC18" || comments[1].RuleID != "" {
+		t.Fatalf("rule ids = %+v", comments)
+	}
+}
+
 // TestParseComments_CategorySeverity verifies the structured category and severity
 // fields are read off each comment object when present, and left zero-valued when
 // absent (older/less-capable models that omit them still produce valid comments).

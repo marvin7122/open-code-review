@@ -905,6 +905,11 @@ dispatchLoop:
 		if comments := a.args.CommentCollector.Comments(); len(comments) > 0 {
 			return comments, nil
 		}
+		// A run cut short by its hard budget did not fail: it stopped as
+		// configured before any file finished (recorded as truncated).
+		if a.runner.Truncated() {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("all %d file review(s) failed — check your LLM configuration and API key", dispatched)
 	}
 

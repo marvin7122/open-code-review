@@ -18,6 +18,9 @@ type LlmComment struct {
 	// Severity indicates the importance of the finding. One of:
 	// critical, high, medium, low.
 	Severity string `json:"severity,omitempty"`
+	// RuleID is the id of the project rule the finding reports (e.g. QC18),
+	// as the model stated it in the code_comment call; empty if it gave none.
+	RuleID string `json:"rule_id,omitempty"`
 }
 
 // CodeReviewResult holds raw LLM-generated review suggestion for a code segment.
