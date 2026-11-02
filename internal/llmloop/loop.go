@@ -96,12 +96,18 @@ type Runner struct {
 	totalOutputTokens     int64
 	totalCacheReadTokens  int64
 	totalCacheWriteTokens int64
-	warningsMu            sync.Mutex
-	warnings              []AgentWarning
-	toolCallsMu           sync.Mutex
-	toolCalls             map[string]int64
-	toolCallSequence      int64
-	toolFailures          []ToolFailureDetail
+	totalCalls            int64 // model calls, atomically updated
+	// budget is the hard run budget (see budget.go); truncation holds the
+	// reason once it was reached.
+	budget           Budget
+	truncation       atomic.Value
+	usageFileMu      sync.Mutex
+	warningsMu       sync.Mutex
+	warnings         []AgentWarning
+	toolCallsMu      sync.Mutex
+	toolCalls        map[string]int64
+	toolCallSequence int64
+	toolFailures     []ToolFailureDetail
 	// bg tracks every background goroutine that can still issue an LLM
 	// request after RunMainTask returned. WaitBackground joins them so a
 	// retry-report Freeze at the run boundary cannot observe an
@@ -125,7 +131,7 @@ type ToolFailureDetail struct {
 
 // NewRunner returns a Runner bound to the given dependencies.
 func NewRunner(deps Deps) *Runner {
-	return &Runner{deps: deps}
+	return &Runner{deps: deps, budget: BudgetFromEnv()}
 }
 
 // WaitBackground blocks until every background job started by this Runner has
@@ -244,13 +250,7 @@ func (r *Runner) recordToolFailure(number int64, name, taskKey, errMsg string,
 // in agent / future scan phases) that perform their own LLM calls outside
 // RunMainTask.
 func (r *Runner) RecordUsage(u *llm.UsageInfo) {
-	if u == nil {
-		return
-	}
-	atomic.AddInt64(&r.totalInputTokens, u.PromptTokens)
-	atomic.AddInt64(&r.totalOutputTokens, u.CompletionTokens)
-	atomic.AddInt64(&r.totalCacheReadTokens, u.CacheReadTokens)
-	atomic.AddInt64(&r.totalCacheWriteTokens, u.CacheWriteTokens)
+	r.addUsage(u)
 }
 
 // CollectPendingComments awaits any async comment-processing workers and
@@ -284,6 +284,10 @@ const (
 	// StopCompression — context compression exceeded its threshold, so the loop
 	// could not continue. Token/context driven but not a declared budget.
 	StopCompression
+	// StopBudget — the run's hard budget (model calls, tokens or cost, see
+	// budget.go) was reached; the findings so far are kept. A declared budget
+	// limit.
+	StopBudget
 )
 
 // String names the stop for diagnostics — telemetry attributes, log lines and
@@ -299,6 +303,8 @@ func (s MainLoopStop) String() string {
 		return "empty_rounds"
 	case StopCompression:
 		return "compression"
+	case StopBudget:
+		return "budget"
 	default:
 		return fmt.Sprintf("MainLoopStop(%d)", int(s))
 	}
@@ -328,6 +334,8 @@ func (s MainLoopStop) Reason() string {
 		return "stopped after repeated rounds without a usable tool result"
 	case StopCompression:
 		return "stopped because context compression exceeded its threshold"
+	case StopBudget:
+		return "stopped at the hard budget of the run (model calls, tokens or cost)"
 	default:
 		return fmt.Sprintf("main task stopped for an unrecognized reason (stop=%d)", int(s))
 	}
@@ -380,6 +388,11 @@ func (r *Runner) RunMainTask(ctx context.Context, messages []llm.Message, taskKe
 		default:
 		}
 
+		if r.BudgetExhausted() {
+			stop = StopBudget
+			break
+		}
+
 		toolReqCount--
 
 		fs := r.deps.Session.GetOrCreateFileSession(taskKey)
@@ -410,11 +423,8 @@ func (r *Runner) RunMainTask(ctx context.Context, messages []llm.Message, taskKe
 		totalTokens := int64(0)
 		if resp.Usage != nil {
 			totalTokens = resp.Usage.TotalTokens
-			atomic.AddInt64(&r.totalInputTokens, resp.Usage.PromptTokens)
-			atomic.AddInt64(&r.totalOutputTokens, resp.Usage.CompletionTokens)
-			atomic.AddInt64(&r.totalCacheReadTokens, resp.Usage.CacheReadTokens)
-			atomic.AddInt64(&r.totalCacheWriteTokens, resp.Usage.CacheWriteTokens)
 		}
+		r.addUsage(resp.Usage)
 		telemetry.RecordLLMResult(llmSpan, duration, totalTokens, nil)
 		llmSpan.End()
 		telemetry.RecordLLMRequest(ctx, r.deps.Model, duration, totalTokens, "ok")
@@ -553,11 +563,8 @@ func (r *Runner) runGraceRound(ctx context.Context, messages []llm.Message, task
 	totalTokens := int64(0)
 	if resp.Usage != nil {
 		totalTokens = resp.Usage.TotalTokens
-		atomic.AddInt64(&r.totalInputTokens, resp.Usage.PromptTokens)
-		atomic.AddInt64(&r.totalOutputTokens, resp.Usage.CompletionTokens)
-		atomic.AddInt64(&r.totalCacheReadTokens, resp.Usage.CacheReadTokens)
-		atomic.AddInt64(&r.totalCacheWriteTokens, resp.Usage.CacheWriteTokens)
 	}
+	r.addUsage(resp.Usage)
 	telemetry.RecordLLMResult(llmSpan, duration, totalTokens, nil)
 	llmSpan.End()
 	telemetry.RecordLLMRequest(ctx, r.deps.Model, duration, totalTokens, "ok")
@@ -718,12 +725,7 @@ func (r *Runner) executeToolCall(ctx context.Context, taskKey string, call llm.T
 							_, resp := diff.ReLocateComment(reqCtx, cm, d, r.deps.LLMClient, msgs, r.deps.Model, r.deps.Template.CompletionTokenLimit())
 							if resp != nil {
 								rlRec.SetResponse(resp, time.Since(rlStart))
-								if resp.Usage != nil {
-									atomic.AddInt64(&r.totalInputTokens, resp.Usage.PromptTokens)
-									atomic.AddInt64(&r.totalOutputTokens, resp.Usage.CompletionTokens)
-									atomic.AddInt64(&r.totalCacheReadTokens, resp.Usage.CacheReadTokens)
-									atomic.AddInt64(&r.totalCacheWriteTokens, resp.Usage.CacheWriteTokens)
-								}
+								r.addUsage(resp.Usage)
 							} else {
 								rlRec.SetError(fmt.Errorf("re-location LLM call failed"), time.Since(rlStart))
 							}

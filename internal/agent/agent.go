@@ -701,6 +701,19 @@ dispatchLoop:
 	for gi := range groups {
 		group := groups[gi]
 
+		// The run's hard budget (llmloop.Budget): once reached, no further group
+		// starts; groups in flight stop at their next turn. Coverage is
+		// attributed as for the token budget below.
+		if a.runner.BudgetExhausted() {
+			a.budgetExceeded.Store(true)
+			if b := a.session.Manifest(); b != nil {
+				if err := b.SetPendingFailureCause(session.FailureBudget, "hard run budget reached before dispatch completed"); err != nil {
+					a.recordWarning("manifest_error", "", err.Error())
+				}
+			}
+			break
+		}
+
 		// Per-group budget look-ahead, checked BEFORE acquiring the semaphore:
 		// if tokens already spent plus an estimate of this group's cost would
 		// exceed the budget, stop scheduling further groups. Any group already
@@ -1266,7 +1279,7 @@ func classifyItemError(err error) (session.FailureClass, string) {
 // json runs the progress lines that would say why an item stopped are discarded,
 // so that string is the only stop diagnostic that leaves a CI runner.
 func classifyMainLoopStop(stop llmloop.MainLoopStop) (session.FailureClass, string) {
-	if stop == llmloop.StopMaxRounds {
+	if stop == llmloop.StopMaxRounds || stop == llmloop.StopBudget {
 		return session.FailureBudget, stop.Reason()
 	}
 	return session.FailureUnknown, stop.Reason()
@@ -1861,6 +1874,12 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 
 	ft := a.args.Template.ReviewFilterTask
 	if ft == nil || len(ft.Messages) == 0 {
+		return
+	}
+	// Past the hard budget no model call starts, the filter's included; the
+	// group's findings are then posted unfiltered (the run is truncated).
+	if a.runner.BudgetExhausted() {
+		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter skipped for group %q (hard budget reached)\n", groupKey)
 		return
 	}
 

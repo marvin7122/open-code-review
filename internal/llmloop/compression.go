@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/alibaba/open-code-review/internal/llm"
@@ -267,12 +266,7 @@ func (r *Runner) runCompression(ctx context.Context, msgs []llm.Message, taskKey
 		return msgs, fmt.Errorf("memory compression: %w", err)
 	}
 	rec.SetResponse(resp, duration)
-	if resp.Usage != nil {
-		atomic.AddInt64(&r.totalInputTokens, resp.Usage.PromptTokens)
-		atomic.AddInt64(&r.totalOutputTokens, resp.Usage.CompletionTokens)
-		atomic.AddInt64(&r.totalCacheReadTokens, resp.Usage.CacheReadTokens)
-		atomic.AddInt64(&r.totalCacheWriteTokens, resp.Usage.CacheWriteTokens)
-	}
+	r.addUsage(resp.Usage)
 
 	rawSummary := stripMarkdownFences(resp.Content())
 	if rawSummary == "" {

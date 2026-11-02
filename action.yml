@@ -156,6 +156,46 @@ inputs:
       linking the rule's knowledge card. Empty adds no links.
     required: false
     default: ''
+  max_llm_calls:
+    description: >-
+      Hard cap on the model calls of this run (OCR_MAX_LLM_CALLS). Once
+      reached, no further call starts; the findings so far are posted and the
+      run is marked truncated. Empty or 0 is unlimited.
+    required: false
+    default: ''
+  max_run_tokens:
+    description: >-
+      Hard cap on the input (cache reads included) plus output tokens of this
+      run (OCR_MAX_RUN_TOKENS); behaves like max_llm_calls. Empty or 0 is
+      unlimited.
+    required: false
+    default: ''
+  max_run_cost_usd:
+    description: >-
+      Hard cap on the cost of this run in USD at the price_* inputs
+      (OCR_MAX_RUN_COST_USD); behaves like max_llm_calls. Empty or 0 is
+      unlimited.
+    required: false
+    default: ''
+  price_input_per_m:
+    description: USD per 1 M uncached input tokens, for max_run_cost_usd and the usage log.
+    required: false
+    default: ''
+  price_cache_hit_per_m:
+    description: USD per 1 M input tokens served from the provider's cache.
+    required: false
+    default: ''
+  price_output_per_m:
+    description: USD per 1 M output tokens.
+    required: false
+    default: ''
+  usage_file:
+    description: >-
+      Path of a JSON usage snapshot (calls, tokens, cost, truncated) rewritten
+      after every model call (OCR_USAGE_FILE), so a run that is killed still
+      leaves its spend. Empty writes none; the usage is logged either way.
+    required: false
+    default: ''
   stream_progress:
     description: >-
       Stream live [ocr] review progress to the workflow log (human audience
@@ -947,6 +987,13 @@ runs:
         OCR_REVIEW_FILTER_EXTRA_BODY: ${{ inputs.review_filter_llm_extra_body }}
         OCR_FILE_READ_MAX_LINES: ${{ inputs.file_read_max_lines }}
         OCR_CODE_SEARCH_MAX_COUNT: ${{ inputs.code_search_max_count }}
+        OCR_MAX_LLM_CALLS: ${{ inputs.max_llm_calls }}
+        OCR_MAX_RUN_TOKENS: ${{ inputs.max_run_tokens }}
+        OCR_MAX_RUN_COST_USD: ${{ inputs.max_run_cost_usd }}
+        OCR_PRICE_INPUT_PER_M: ${{ inputs.price_input_per_m }}
+        OCR_PRICE_CACHE_HIT_PER_M: ${{ inputs.price_cache_hit_per_m }}
+        OCR_PRICE_OUTPUT_PER_M: ${{ inputs.price_output_per_m }}
+        OCR_USAGE_FILE: ${{ inputs.usage_file }}
         # Step output, not job env: empty when the resolve step was skipped or
         # chose the full range, and never inherited from an earlier use of this
         # action in the same job.
