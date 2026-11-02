@@ -1,5 +1,5 @@
 {
-  "_comment": "The one definition of the reviewer feedback on OpenCodeReview findings: the poster renders the legend under every finding from it, and marvin7122/ocr-runners feedback/collect.py and propose.py read reactions and reply keywords with it. Change meanings only here.",
+  "_comment": "The one definition of the reviewer feedback on OpenCodeReview findings: the poster renders the legend under every finding from it, and marvin7122/ocr-runners feedback/collect.py and propose.py read reactions and reply keywords with it. Change meanings only here. Keywords with \"feedback\": false are commands of the apply-replies flow (marvin7122/qlever .opencodereview/apply_replies.py), not feedback on the finding; \"scope\": \"pr\" marks those posted as a PR comment instead of a reply.",
   "version": 2,
   "reactions": [
     { "content": "+1", "emoji": "👍", "key": "actionable", "meaning": "actionable" },
@@ -17,7 +17,11 @@
   "keywords": [
     { "keyword": "/not-actionable", "key": "not_actionable", "takes_text": false, "meaning": "correct, but not worth acting on" },
     { "keyword": "/improve", "key": "improve", "takes_text": true, "meaning": "how this comment should be better" },
-    { "keyword": "/wrong", "key": "wrong", "takes_text": true, "meaning": "why it is wrong" }
+    { "keyword": "/wrong", "key": "wrong", "takes_text": true, "meaning": "why it is wrong" },
+    { "keyword": "/approve", "key": "actionable", "takes_text": false, "meaning": "apply the change proposed in this thread" },
+    { "keyword": "/reject", "key": "reject", "takes_text": false, "feedback": false, "meaning": "drop the change proposed in this thread" },
+    { "keyword": "/apply-replies", "key": "apply_replies", "takes_text": false, "feedback": false, "scope": "pr", "meaning": "(as a PR comment, not a reply) act on all reactions and replies: mechanical fixes are committed, behavior changes are proposed for /approve" },
+    { "keyword": "/approve-all", "key": "approve_all", "takes_text": false, "feedback": false, "scope": "pr", "meaning": "(as a PR comment, not a reply) apply every pending proposal" }
   ],
   "useful": ["actionable", "valuable", "fixed"],
   "wording": ["confusing", "too_long"]
