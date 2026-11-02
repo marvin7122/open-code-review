@@ -114,3 +114,23 @@ func (c *CommentCollector) RemoveByPathAndIndices(path string, indices map[int]s
 	}
 	c.comments = kept
 }
+
+// UpdateByPathAndIndex applies update to the comment of path whose per-path
+// index (0-based position among all comments with that path, as in
+// RemoveByPathAndIndices) is index. It reports whether that comment exists.
+func (c *CommentCollector) UpdateByPathAndIndex(path string, index int, update func(*model.LlmComment)) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pathIdx := 0
+	for i := range c.comments {
+		if c.comments[i].Path != path {
+			continue
+		}
+		if pathIdx == index {
+			update(&c.comments[i])
+			return true
+		}
+		pathIdx++
+	}
+	return false
+}
