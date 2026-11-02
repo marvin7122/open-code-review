@@ -18,13 +18,19 @@ import (
 // limits are unlimited.
 const (
 	envMaxLLMCalls     = "OCR_MAX_LLM_CALLS"     // model calls of the run
-	envMaxRunTokens    = "OCR_MAX_RUN_TOKENS"    // input (incl. cache reads) + output tokens
+	envMaxRunTokens    = "OCR_MAX_RUN_TOKENS"    // uncached input + output tokens (cache hits are not counted)
 	envMaxRunCostUSD   = "OCR_MAX_RUN_COST_USD"  // cost at the prices below
 	envPriceInputPerM  = "OCR_PRICE_INPUT_PER_M" // USD per 1 M uncached input tokens
 	envPriceCachePerM  = "OCR_PRICE_CACHE_HIT_PER_M"
 	envPriceOutputPerM = "OCR_PRICE_OUTPUT_PER_M"
 	envUsageFile       = "OCR_USAGE_FILE" // JSON usage snapshot, rewritten after every call
+	// Share of OCR_MAX_RUN_COST_USD kept for verifying the findings (the
+	// review filter): exploration ends at (1 - reserve) of it. Default 0.2.
+	envVerifyReserve = "OCR_VERIFY_RESERVE"
 )
+
+// defaultVerifyReserve is the share of the cost cap kept for verification.
+const defaultVerifyReserve = 0.2
 
 // Prices are USD per million tokens.
 type Prices struct {
@@ -40,14 +46,18 @@ func (p Prices) Cost(input, cacheRead, output int64) float64 {
 	return (float64(uncached)*p.InputPerM + float64(cacheRead)*p.CacheHitPerM + float64(output)*p.OutputPerM) / 1e6
 }
 
-// Budget is a hard limit on one run (one fan-out leg): once a limit is
-// reached, no further model call starts, and the run reports what it found so
-// far, marked as truncated. Zero limits are unlimited.
+// Budget is a hard limit on one run (one fan-out leg). Exploration (review
+// turns, further files) stops at the call cap, the token cap (uncached input
+// plus output: cache hits cost a fiftieth of a miss and would otherwise
+// dominate), or (1 - VerifyReserve) of the cost cap; the run then reports what
+// it found so far, marked as truncated. The review filter may spend the rest of
+// the cost cap, so findings are verified. Zero limits are unlimited.
 type Budget struct {
-	MaxCalls   int64
-	MaxTokens  int64
-	MaxCostUSD float64
-	Prices     Prices
+	MaxCalls      int64
+	MaxTokens     int64
+	MaxCostUSD    float64
+	VerifyReserve float64
+	Prices        Prices
 	// UsageFile, if set, receives a JSON usage snapshot after every call, so
 	// the spend of a run that is killed (provider error, timeout) is known.
 	UsageFile string
@@ -63,12 +73,23 @@ func BudgetFromEnv() Budget {
 		return v
 	}
 	return Budget{
-		MaxCalls:   int64(num(envMaxLLMCalls)),
-		MaxTokens:  int64(num(envMaxRunTokens)),
-		MaxCostUSD: num(envMaxRunCostUSD),
-		Prices:     Prices{num(envPriceInputPerM), num(envPriceCachePerM), num(envPriceOutputPerM)},
-		UsageFile:  os.Getenv(envUsageFile),
+		MaxCalls:      int64(num(envMaxLLMCalls)),
+		MaxTokens:     int64(num(envMaxRunTokens)),
+		MaxCostUSD:    num(envMaxRunCostUSD),
+		VerifyReserve: verifyReserveFromEnv(),
+		Prices:        Prices{num(envPriceInputPerM), num(envPriceCachePerM), num(envPriceOutputPerM)},
+		UsageFile:     os.Getenv(envUsageFile),
 	}
+}
+
+// verifyReserveFromEnv returns OCR_VERIFY_RESERVE if it is in [0, 1), else
+// the default.
+func verifyReserveFromEnv() float64 {
+	v, err := strconv.ParseFloat(os.Getenv(envVerifyReserve), 64)
+	if err != nil || v < 0 || v >= 1 {
+		return defaultVerifyReserve
+	}
+	return v
 }
 
 // UsageSnapshot is the run's usage so far; it is logged and written to the
@@ -131,6 +152,24 @@ func (r *Runner) reportUsage() {
 	}
 }
 
+// UncachedTokens are the uncached input plus output tokens, which the token
+// cap counts.
+func (s UsageSnapshot) UncachedTokens() int64 {
+	uncached := s.InputTokens - s.CacheReadTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	return uncached + s.OutputTokens
+}
+
+// VerificationAllowed reports whether a review filter call may still start:
+// verification may use the whole cost cap, including the reserve that ended
+// exploration, but nothing beyond it.
+func (r *Runner) VerificationAllowed() bool {
+	b := r.budget
+	return b.MaxCostUSD <= 0 || r.Usage().CostUSD < b.MaxCostUSD
+}
+
 // Truncated reports whether the hard budget has already cut the run short.
 // Unlike BudgetExhausted it never marks the run.
 func (r *Runner) Truncated() bool {
@@ -138,7 +177,8 @@ func (r *Runner) Truncated() bool {
 	return ok
 }
 
-// BudgetExhausted reports whether the run has reached a hard limit. The first
+// BudgetExhausted reports whether exploration has reached a limit (calls,
+// tokens, or the cost cap minus the verification reserve). The first
 // time it has, the run is marked truncated (warning, usage file) with the
 // limit as the reason.
 func (r *Runner) BudgetExhausted() bool {
@@ -150,10 +190,12 @@ func (r *Runner) BudgetExhausted() bool {
 	switch {
 	case b.MaxCalls > 0 && s.Calls >= b.MaxCalls:
 		reason = fmt.Sprintf("model-call cap %d reached", b.MaxCalls)
-	case b.MaxTokens > 0 && s.InputTokens+s.OutputTokens >= b.MaxTokens:
-		reason = fmt.Sprintf("token cap %d reached (%d input + %d output)", b.MaxTokens, s.InputTokens, s.OutputTokens)
-	case b.MaxCostUSD > 0 && s.CostUSD >= b.MaxCostUSD:
-		reason = fmt.Sprintf("cost cap $%.2f reached ($%.4f)", b.MaxCostUSD, s.CostUSD)
+	case b.MaxTokens > 0 && s.UncachedTokens() >= b.MaxTokens:
+		reason = fmt.Sprintf("token cap %d reached (%d uncached input + %d output)",
+			b.MaxTokens, s.InputTokens-s.CacheReadTokens, s.OutputTokens)
+	case b.MaxCostUSD > 0 && s.CostUSD >= (1-b.VerifyReserve)*b.MaxCostUSD:
+		reason = fmt.Sprintf("exploration share $%.4f of the cost cap $%.4f reached ($%.4f; the rest is kept for verification)",
+			(1-b.VerifyReserve)*b.MaxCostUSD, b.MaxCostUSD, s.CostUSD)
 	default:
 		return false
 	}

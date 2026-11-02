@@ -1881,13 +1881,6 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	if ft == nil || len(ft.Messages) == 0 {
 		return
 	}
-	// Past the hard budget no model call starts, the filter's included; the
-	// group's findings are then posted unfiltered (the run is truncated).
-	if a.runner.BudgetExhausted() {
-		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter skipped for group %q (hard budget reached)\n", groupKey)
-		return
-	}
-
 	if a.args.SkipFilter {
 		telemetry.SetAttr(span, "skipped", true)
 		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter skipped for group %q (--no-filter)\n", groupKey)
@@ -1918,6 +1911,22 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	}
 	telemetry.SetAttr(span, "comments.before", len(candidates))
 
+	// Verification may use the whole cost cap, including the reserve that
+	// ended exploration. Past it no call starts: the findings are posted, but
+	// marked unverified.
+	if !a.runner.VerificationAllowed() {
+		for _, c := range candidates {
+			a.args.CommentCollector.UpdateByPathAndIndex(c.cm.Path, c.pathIdx, func(cm *model.LlmComment) {
+				cm.Unverified = true
+			})
+		}
+		a.recordWarning("findings_unverified", g.Diffs[0].NewPath,
+			fmt.Sprintf("%d finding(s) of group %q not verified: the cost cap was reached", len(candidates), groupKey))
+		fmt.Fprintf(stdout.Writer(), "[ocr] Review filter skipped for group %q (cost cap reached); %d finding(s) marked unverified\n",
+			groupKey, len(candidates))
+		return
+	}
+
 	// Build the comment list for the filter prompt.
 	candidateComments := make([]model.LlmComment, len(candidates))
 	for i, c := range candidates {
@@ -1926,12 +1935,23 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	commentsJSON := buildGroupFilterCommentsJSON(candidateComments)
 	concatenatedDiffs := buildConcatenatedDiffs(g.Diffs)
 
+	// With the run's rule statements, the filter also checks that each
+	// finding fits the rule it names (see rule_fit.go): a section after the
+	// last message's text, and one more tool.
+	statements := loadRuleStatements()
+	tools := filterTools
+	if len(statements) > 0 {
+		tools = append(append([]llm.ToolDef(nil), filterTools...), ruleFitTool(statements))
+	}
 	messages := make([]llm.Message, 0, len(ft.Messages))
-	for _, m := range ft.Messages {
+	for i, m := range ft.Messages {
 		content := m.Content
 		content = strings.ReplaceAll(content, "{{path}}", groupKey)
 		content = strings.ReplaceAll(content, "{{diff}}", concatenatedDiffs)
 		content = strings.ReplaceAll(content, "{{comments}}", commentsJSON)
+		if len(statements) > 0 && i == len(ft.Messages)-1 {
+			content += ruleFitSection(statements)
+		}
 		messages = append(messages, llm.NewTextMessage(m.Role, content))
 	}
 
@@ -1947,7 +1967,7 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	resp, err := a.args.LLMClient.CompletionsWithCtx(reqCtx, llm.ChatRequest{
 		Model:     a.args.Model,
 		Messages:  messages,
-		Tools:     filterTools,
+		Tools:     tools,
 		MaxTokens: a.args.Template.CompletionTokenLimit(),
 	})
 	duration := time.Since(startTime)
@@ -1978,6 +1998,30 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 	indices := parseFilterToolCalls(resp.ToolCalls(), len(candidates))
 	if indices == nil {
 		indices = parseFilterResponse(resp.Content(), len(candidates))
+	}
+	if len(statements) > 0 {
+		for idx, newRule := range parseRuleMismatches(resp.ToolCalls(), len(candidates), statements) {
+			c := candidates[idx]
+			if newRule == "" {
+				if indices == nil {
+					indices = make(map[int]struct{})
+				}
+				indices[idx] = struct{}{}
+				a.recordWarning("filter_rule_mismatch", c.cm.Path,
+					fmt.Sprintf("rule %s does not fit; finding dropped: %s", c.cm.RuleID, c.cm.Content))
+				continue
+			}
+			if _, removed := indices[idx]; removed || newRule == c.cm.RuleID {
+				continue
+			}
+			oldRule := c.cm.RuleID
+			a.args.CommentCollector.UpdateByPathAndIndex(c.cm.Path, c.pathIdx, func(cm *model.LlmComment) {
+				cm.RuleID = newRule
+				cm.Content = reassignRule(cm.Content, oldRule, newRule)
+			})
+			a.recordWarning("filter_rule_reassigned", c.cm.Path,
+				fmt.Sprintf("rule %s does not fit; re-assigned to %s: %s", oldRule, newRule, c.cm.Content))
+		}
 	}
 	telemetry.SetAttr(span, "comments.filtered", len(indices))
 	if len(indices) == 0 {
@@ -2016,6 +2060,7 @@ func buildGroupFilterCommentsJSON(comments []model.LlmComment) string {
 	type filterComment struct {
 		ID           string `json:"id"`
 		Path         string `json:"path"`
+		RuleID       string `json:"rule_id,omitempty"`
 		Content      string `json:"content"`
 		ExistingCode string `json:"existing_code,omitempty"`
 	}
@@ -2024,6 +2069,7 @@ func buildGroupFilterCommentsJSON(comments []model.LlmComment) string {
 		items[i] = filterComment{
 			ID:           fmt.Sprintf("c-%d", i),
 			Path:         cm.Path,
+			RuleID:       cm.RuleID,
 			Content:      cm.Content,
 			ExistingCode: cm.ExistingCode,
 		}

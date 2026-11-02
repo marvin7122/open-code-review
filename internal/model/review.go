@@ -21,6 +21,9 @@ type LlmComment struct {
 	// RuleID is the id of the project rule the finding reports (e.g. QC18),
 	// as the model stated it in the code_comment call; empty if it gave none.
 	RuleID string `json:"rule_id,omitempty"`
+	// Unverified marks a finding the review filter could not check because
+	// the run's budget was used up; it is posted with a visible note.
+	Unverified bool `json:"unverified,omitempty"`
 }
 
 // CodeReviewResult holds raw LLM-generated review suggestion for a code segment.

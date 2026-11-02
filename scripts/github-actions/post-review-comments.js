@@ -261,9 +261,18 @@ async function runPostReviewComments({
 
   const gate = gateFindingRules(result.comments || [], parseRuleIds(process.env.OCR_LEG_RULE_IDS),
     loadVerifiedLinks(), log);
-  const comments = gate.posted;
-  writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, gate.stats, log);
+  let comments = gate.posted;
   const warnings = result.warnings || [];
+  // The verification step's rule-fit decisions (see the CLI's review filter).
+  const countWarnings = (type) => warnings.filter((w) => w && w.type === type).length;
+  const ruleStats = {
+    ...gate.stats,
+    rejected_invalid_citation: 0,
+    rejected_rule_does_not_fit: countWarnings("filter_rule_mismatch"),
+    reassigned_rule: countWarnings("filter_rule_reassigned"),
+    unverified: comments.filter((c) => c.unverified).length,
+  };
+  writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, ruleStats, log);
   stats.total = comments.length;
 
   // No comments: post a "looks good" summary.
@@ -288,6 +297,18 @@ async function runPostReviewComments({
       pull_number: prNumber,
     });
     commitSha = pullRequest.head.sha;
+  }
+
+  // Anchor every finding over its lines, attach code excerpts from the head
+  // commit, and reject findings that cite a missing file or line.
+  if (process.env.OCR_FINDING_CONTEXT === "true" && comments.length > 0) {
+    const diff = await getPrDiffHunks({ github, owner, repo, prNumber, commitSha, log, cache: {} });
+    const withContext = await addFindingContext({ github, owner, repo, sha: commitSha, comments, diff, log });
+    comments = withContext.posted;
+    ruleStats.findings = comments.length;
+    ruleStats.rejected_invalid_citation = withContext.rejectedInvalidCitation;
+    writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, ruleStats, log);
+    stats.total = comments.length;
   }
 
   // Partition: inline (with valid line info) vs summary (without) vs routed
@@ -1779,13 +1800,26 @@ function buildRuleCardLine(comment, cards = loadRuleCards()) {
   // A gated finding links its rule's entry and its card, both verified.
   if (comment.ruleLinks) {
     const { rule_url: ruleUrl, card_url: cardUrl, title } = comment.ruleLinks;
-    return `\n\nRule: [${comment.rule}](${ruleUrl}) · Card: [${title || comment.rule}](${cardUrl})`;
+    return `\n\nRule: [${escapeLinkText(comment.rule)}](${ruleUrl}) · Card: [${escapeLinkText(title || comment.rule)}](${cardUrl})`;
   }
   const ruleId = findingRuleId(comment);
   const card = ruleId ? cards[ruleId] : null;
   if (!card || !card.url) return "";
   const title = card.title ? `: ${card.title}` : "";
   return `\n\nRule [${ruleId}](${card.url})${title}`;
+}
+
+// Square brackets in link text (e.g. `[[gnu::noinline]]`) would end the link
+// early; escape them.
+function escapeLinkText(text) {
+  return String(text).replace(/[[\]]/g, "\\$&");
+}
+
+// A finding the review filter could not check (the budget was used up).
+function unverifiedNote(comment) {
+  return comment.unverified
+    ? "\n\n⚠️ **Unverified:** the verification step did not run for this finding (the review's budget was used up)."
+    : "";
 }
 
 // The reactions a reviewer can leave on a finding; a scheduled job collects
@@ -1815,7 +1849,9 @@ function formatComment(comment, id) {
   const badge = buildBadgeImage(comment);
   if (badge) body += `${badge}\n`;
   body += comment.content || "";
+  body += unverifiedNote(comment);
   body += buildRuleCardLine(comment);
+  if (comment.contextBlock) body += `\n\n${comment.contextBlock}`;
   if (comment.suggestion_code && comment.existing_code) {
     body += "\n\n**Suggestion:**\n";
     body += fencedBlock(comment.suggestion_code, "suggestion");
@@ -1841,7 +1877,9 @@ function formatCommentMarkdown(comment, error) {
     md += `⚠️ GitHub could not post this as an inline comment: ${error}\n\n`;
   }
   md += comment.content || "";
+  md += unverifiedNote(comment);
   md += buildRuleCardLine(comment);
+  if (comment.contextBlock) md += `\n\n${comment.contextBlock}`;
 
   if (comment.suggestion_code && comment.existing_code) {
     md += "\n\n<details><summary>💡 Suggested Change</summary>\n\n";
@@ -1960,6 +1998,143 @@ function formatWarningEntry(w) {
     }
   }
   return String(w);
+}
+
+// ---- Finding context (OCR_FINDING_CONTEXT=true) ----
+//
+// Every inline finding is anchored over the lines it is about and shows code
+// generated from the file at the review's head commit, never written by the
+// model: its anchored range with surrounding lines, and every location it
+// cites as `path:line` (or `path:a-b`). A citation of a missing file or line
+// rejects the finding ("invalid citation").
+
+const CONTEXT_LINES = 10;
+const CITATION_CONTEXT_LINES = 3;
+const MAX_CITATIONS = 4;
+const CITATION_PATTERN =
+  /(?<![\w/.-])((?:[\w.-]+\/)*[\w.-]+\.(?:h|hh|hpp|c|cc|cpp|cxx|py|js|ts|go|rs|java|json|ya?ml|cmake|txt|md))(?::|#L)(\d+)(?:-L?(\d+))?/g;
+
+// The `path:line` / `path:a-b` locations a finding cites, in order, without
+// duplicates.
+function parseCitations(text) {
+  const seen = new Set();
+  const result = [];
+  for (const m of String(text || "").matchAll(CITATION_PATTERN)) {
+    const start = Number(m[2]);
+    const end = m[3] ? Number(m[3]) : start;
+    const key = `${m[1]}:${start}-${end}`;
+    if (start < 1 || end < start || seen.has(key)) continue;
+    seen.add(key);
+    result.push({ path: m[1], start, end });
+  }
+  return result;
+}
+
+// The range a finding is anchored over: its own lines plus the lines it
+// cites in the same file, clamped to the diff hunk that holds its last line
+// (GitHub requires both ends of a multi-line comment in one hunk). Without a
+// known hunk the finding's own lines are kept.
+function anchorRange(comment, citations, hunkRanges) {
+  const own = [comment.start_line, comment.end_line].filter((n) => n >= 1);
+  if (own.length === 0) return null;
+  let start = Math.min(...own);
+  let end = Math.max(...own);
+  const hunk = (hunkRanges || []).find((r) => end >= r.start && end <= r.end);
+  if (!hunk) return { start, end };
+  for (const c of citations) {
+    if (c.path !== comment.path) continue;
+    start = Math.min(start, c.start);
+    end = Math.max(end, c.end);
+  }
+  return { start: Math.max(start, hunk.start), end: Math.min(end, hunk.end) };
+}
+
+function blobUrl(owner, repo, sha, path, start, end) {
+  const anchor = start === end ? `#L${start}` : `#L${start}-L${end}`;
+  return `https://github.com/${owner}/${repo}/blob/${sha}/${path}${anchor}`;
+}
+
+function fenceLanguage(path) {
+  const ext = (path.match(/\.([a-z0-9]+)$/i) || [])[1] || "";
+  return { h: "cpp", hh: "cpp", hpp: "cpp", c: "c", cc: "cpp", cpp: "cpp", cxx: "cpp", py: "python", js: "js", ts: "ts",
+    go: "go", rs: "rust", java: "java", json: "json", yml: "yaml", yaml: "yaml" }[ext.toLowerCase()] || "";
+}
+
+// A numbered excerpt of fileLines around start..end (`context` lines on both
+// sides, clamped to the file), with the lines start..end marked by ">", in a
+// collapsible block titled with the range, and a permalink to the range.
+function renderExcerpt(fileLines, path, start, end, context, url) {
+  const from = Math.max(1, start - context);
+  const to = Math.min(fileLines.length, end + context);
+  const width = String(to).length;
+  const body = [];
+  for (let n = from; n <= to; n++) {
+    const mark = n >= start && n <= end ? ">" : " ";
+    body.push(`${mark} ${String(n).padStart(width)} ${fileLines[n - 1]}`);
+  }
+  const range = start === end ? `L${start}` : `L${start}-L${end}`;
+  return `<details><summary><code>${path}</code> ${range}</summary>\n\n` +
+    fencedBlock(body.join("\n"), fenceLanguage(path)) + `\n\n[${path}#${range}](${url})\n</details>`;
+}
+
+// Fetch a file at the head commit, as an array of lines, or null.
+async function fetchFileLines({ github, owner, repo, sha, path, cache, log }) {
+  if (cache.has(path)) return cache.get(path);
+  let lines = null;
+  try {
+    const { data } = await github.rest.repos.getContent({ owner, repo, path, ref: sha });
+    if (data && typeof data.content === "string") {
+      lines = Buffer.from(data.content, data.encoding || "base64").toString("utf8").replace(/\n$/, "").split("\n");
+    }
+  } catch (e) {
+    log(`Could not read ${path}@${sha}: ${e.status || e.message}`);
+  }
+  cache.set(path, lines);
+  return lines;
+}
+
+// Anchor every finding, attach its context, and reject the ones with an
+// invalid citation. Returns {posted, rejectedInvalidCitation}.
+async function addFindingContext({ github, owner, repo, sha, comments, diff, log = console.log }) {
+  const cache = new Map();
+  const posted = [];
+  let rejectedInvalidCitation = 0;
+  for (const comment of comments) {
+    const citations = parseCitations(comment.content).slice(0, MAX_CITATIONS);
+    let invalid = null;
+    for (const c of citations) {
+      const lines = await fetchFileLines({ github, owner, repo, sha, path: c.path, cache, log });
+      if (!lines) invalid = `${c.path} does not exist at ${sha.slice(0, 9)}`;
+      else if (c.end > lines.length) invalid = `${c.path}:${c.end} is past its last line ${lines.length}`;
+      if (invalid) break;
+    }
+    if (invalid) {
+      rejectedInvalidCitation += 1;
+      log(`Rejected finding (invalid citation: ${invalid}) at ${comment.path}:${comment.start_line}: ${comment.content}`);
+      continue;
+    }
+    const hunks = diff && diff.files ? diff.files.get(comment.path) : null;
+    const range = anchorRange(comment, citations, hunks);
+    const blocks = [];
+    if (range) {
+      comment.start_line = range.start;
+      comment.end_line = range.end;
+      const lines = await fetchFileLines({ github, owner, repo, sha, path: comment.path, cache, log });
+      if (lines && range.end <= lines.length) {
+        blocks.push(renderExcerpt(lines, comment.path, range.start, range.end, CONTEXT_LINES,
+          blobUrl(owner, repo, sha, comment.path, range.start, range.end)));
+      }
+    }
+    for (const c of citations) {
+      if (range && c.path === comment.path && c.start >= range.start && c.end <= range.end) continue;
+      const lines = cache.get(c.path);
+      blocks.push(renderExcerpt(lines, c.path, c.start, c.end, CITATION_CONTEXT_LINES,
+        blobUrl(owner, repo, sha, c.path, c.start, c.end)));
+    }
+    comment.contextBlock = blocks.join("\n\n");
+    posted.push(comment);
+  }
+  return { posted, rejectedInvalidCitation };
 }
 
 function fencedBlock(content, language = "") {
@@ -2828,6 +3003,11 @@ module.exports = {
   buildFeedbackMeta,
   findingRuleId,
   gateFindingRules,
+  parseCitations,
+  anchorRange,
+  renderExcerpt,
+  addFindingContext,
+  escapeLinkText,
   parseRuleIds,
   FEEDBACK_LEGEND,
   formatComment,

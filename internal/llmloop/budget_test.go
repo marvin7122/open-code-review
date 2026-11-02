@@ -36,7 +36,7 @@ func TestBudgetFromEnv(t *testing.T) {
 	t.Setenv(envPriceOutputPerM, "-1")
 	t.Setenv(envUsageFile, "/tmp/usage.json")
 	b := BudgetFromEnv()
-	want := Budget{MaxCalls: 40, MaxTokens: 3_000_000, MaxCostUSD: 0.25, Prices: Prices{InputPerM: 0.14}, UsageFile: "/tmp/usage.json"}
+	want := Budget{MaxCalls: 40, MaxTokens: 3_000_000, MaxCostUSD: 0.25, VerifyReserve: 0.2, Prices: Prices{InputPerM: 0.14}, UsageFile: "/tmp/usage.json"}
 	if b != want {
 		t.Errorf("BudgetFromEnv() = %+v, want %+v", b, want)
 	}
@@ -68,14 +68,15 @@ func TestBudgetExhausted(t *testing.T) {
 		t.Error("the truncation warning must be recorded once")
 	}
 
-	tokens := newBudgetRunner(Budget{MaxTokens: 2000})
+	// 200 uncached input + 100 output per call count; the 800 cache hits do not.
+	tokens := newBudgetRunner(Budget{MaxTokens: 500})
 	tokens.addUsage(usage)
 	if tokens.BudgetExhausted() {
-		t.Fatal("token cap reached at 1100 of 2000")
+		t.Fatal("token cap reached at 300 of 500")
 	}
 	tokens.addUsage(usage)
 	if !tokens.BudgetExhausted() {
-		t.Fatal("token cap not reached at 2200 of 2000")
+		t.Fatal("token cap not reached at 600 of 500")
 	}
 
 	cost := newBudgetRunner(Budget{MaxCostUSD: 0.0001, Prices: Prices{InputPerM: 100}})
@@ -86,6 +87,40 @@ func TestBudgetExhausted(t *testing.T) {
 
 	if newBudgetRunner(Budget{}).BudgetExhausted() {
 		t.Error("an empty budget is unlimited")
+	}
+}
+
+// Exploration ends at (1 - reserve) of the cost cap; verification may spend
+// up to the cap itself.
+func TestVerificationReserve(t *testing.T) {
+	// $1 per 1 M uncached input tokens: 100 tokens cost $0.0001.
+	r := newBudgetRunner(Budget{MaxCostUSD: 0.001, VerifyReserve: 0.2, Prices: Prices{InputPerM: 1}})
+	r.addUsage(&llm.UsageInfo{PromptTokens: 700}) // $0.0007
+	if r.BudgetExhausted() || !r.VerificationAllowed() {
+		t.Fatal("below 80 % of the cap: exploration and verification allowed")
+	}
+	r.addUsage(&llm.UsageInfo{PromptTokens: 100}) // $0.0008 = 80 %
+	if !r.BudgetExhausted() {
+		t.Fatal("exploration must end at 80 % of the cap")
+	}
+	if !r.VerificationAllowed() {
+		t.Fatal("verification may use the reserve")
+	}
+	r.addUsage(&llm.UsageInfo{PromptTokens: 200}) // $0.0010 = the cap
+	if r.VerificationAllowed() {
+		t.Fatal("no verification beyond the cap")
+	}
+	if !newBudgetRunner(Budget{}).VerificationAllowed() {
+		t.Error("without a cost cap verification is always allowed")
+	}
+
+	t.Setenv(envVerifyReserve, "0.5")
+	if got := BudgetFromEnv().VerifyReserve; got != 0.5 {
+		t.Errorf("reserve = %v, want 0.5", got)
+	}
+	t.Setenv(envVerifyReserve, "1.5")
+	if got := BudgetFromEnv().VerifyReserve; got != defaultVerifyReserve {
+		t.Errorf("an invalid reserve gives the default, got %v", got)
 	}
 }
 

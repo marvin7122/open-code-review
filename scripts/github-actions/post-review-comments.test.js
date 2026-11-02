@@ -16,7 +16,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, gateFindingRules, parseRuleIds, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, gateFindingRules, parseRuleIds, parseCitations, anchorRange, renderExcerpt, addFindingContext, escapeLinkText, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -2299,7 +2299,70 @@ function testGateFindingRules() {
   assert.strictEqual(untouched[0].rule, undefined);
 }
 
+// Finding context: citations, the anchored range, excerpts from the head
+// commit, and the citation gate.
+async function testFindingContext() {
+  assert.deepStrictEqual(parseCitations("see src/a.cpp:120 and src/b.h:5-7, again src/a.cpp:120; not a.cpp:0"), [
+    { path: "src/a.cpp", start: 120, end: 120 },
+    { path: "src/b.h", start: 5, end: 7 },
+  ]);
+
+  // The own line 116 plus a cited line 124 in the same file, inside the hunk
+  // 100..130; a citation outside the hunk is clamped to it.
+  const hunks = [{ start: 10, end: 20 }, { start: 100, end: 130 }];
+  assert.deepStrictEqual(anchorRange({ path: "a.cpp", start_line: 116, end_line: 116 }, [{ path: "a.cpp", start: 124, end: 124 }], hunks),
+    { start: 116, end: 124 });
+  assert.deepStrictEqual(anchorRange({ path: "a.cpp", start_line: 116, end_line: 116 }, [{ path: "a.cpp", start: 140, end: 150 }], hunks),
+    { start: 116, end: 130 }, "clamped to the hunk");
+  assert.deepStrictEqual(anchorRange({ path: "a.cpp", start_line: 116, end_line: 116 }, [{ path: "b.cpp", start: 124, end: 124 }], hunks),
+    { start: 116, end: 116 }, "other files do not move the anchor");
+  assert.deepStrictEqual(anchorRange({ path: "a.cpp", start_line: 5, end_line: 6 }, [{ path: "a.cpp", start: 9, end: 9 }], null),
+    { start: 5, end: 6 }, "without a hunk the own lines stay");
+  assert.strictEqual(anchorRange({ path: "a.cpp" }, [], hunks), null);
+
+  const file = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`);
+  const excerpt = renderExcerpt(file, "src/a.cpp", 12, 13, 2, "https://x/blob/s/src/a.cpp#L12-L13");
+  assert.ok(excerpt.startsWith("<details><summary><code>src/a.cpp</code> L12-L13</summary>"), excerpt);
+  assert.ok(excerpt.includes("  10 line 10\n  11 line 11\n> 12 line 12\n> 13 line 13\n  14 line 14\n  15 line 15"), excerpt);
+  assert.ok(!excerpt.includes("line 9") && !excerpt.includes("line 16"), "context is clamped to 2 lines");
+  assert.ok(excerpt.includes("```cpp") && excerpt.includes("[src/a.cpp#L12-L13](https://x/blob/s/src/a.cpp#L12-L13)"));
+  assert.ok(renderExcerpt(file, "a.cpp", 1, 1, 10, "u").includes(">  1 line 1"), "clamped at the file start");
+
+  // The gate against a fake repository at the head commit.
+  const files = { "src/a.cpp": file.join("\n") + "\n", "src/b.h": "x\ny\n" };
+  const github = { rest: { repos: { getContent: async ({ path, ref }) => {
+    assert.strictEqual(ref, "abc1234567");
+    if (!(path in files)) { const e = new Error("Not Found"); e.status = 404; throw e; }
+    return { data: { content: Buffer.from(files[path]).toString("base64"), encoding: "base64" } };
+  } } } };
+  const diff = { files: new Map([["src/a.cpp", [{ start: 1, end: 30 }]]]) };
+  const logged = [];
+  const comments = [
+    { path: "src/a.cpp", start_line: 12, end_line: 12, content: "QC18: see src/a.cpp:14 and src/b.h:2" },
+    { path: "src/a.cpp", start_line: 5, end_line: 5, content: "PP7: src/b.h:9 does not exist" },
+    { path: "src/a.cpp", start_line: 5, end_line: 5, content: "PP7: src/c.h:1 is not a file" },
+  ];
+  const { posted, rejectedInvalidCitation } = await addFindingContext({ github, owner: "o", repo: "r", sha: "abc1234567",
+    comments, diff, log: (l) => logged.push(l) });
+  assert.strictEqual(posted.length, 1);
+  assert.strictEqual(rejectedInvalidCitation, 2);
+  assert.ok(logged.some((l) => l.includes("invalid citation") && l.includes("src/b.h:9 is past its last line 2")), logged);
+  assert.ok(logged.some((l) => l.includes("src/c.h does not exist")), logged);
+  const kept = posted[0];
+  assert.strictEqual(kept.start_line, 12);
+  assert.strictEqual(kept.end_line, 14, "anchored over the cited line 14");
+  assert.ok(kept.contextBlock.includes("https://github.com/o/r/blob/abc1234567/src/a.cpp#L12-L14"));
+  assert.ok(kept.contextBlock.includes("https://github.com/o/r/blob/abc1234567/src/b.h#L2"), "cited file excerpt");
+  const body = formatComment(kept, "ocr-1-1-abcdef0123456789");
+  assert.ok(body.indexOf("QC18: see") < body.indexOf("<details>"), "excerpts follow the finding");
+
+  assert.strictEqual(escapeLinkText("use [[gnu::noinline]]"), "use \\[\\[gnu::noinline\\]\\]");
+  assert.ok(formatComment({ content: "QC18: x", unverified: true }).includes("⚠️ **Unverified:**"));
+  assert.ok(!formatComment({ content: "QC18: x" }).includes("Unverified"));
+}
+
 async function main() {
+  await testFindingContext();
   testRuleCardLine();
   testGateFindingRules();
   testFeedbackMetaAndLegend();
