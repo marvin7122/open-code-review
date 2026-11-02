@@ -211,6 +211,29 @@ inputs:
     description: Rule-set version (e.g. a hash of the rule file) recorded in each finding's ocr-meta marker.
     required: false
     default: ''
+  leg_rule_ids:
+    description: >-
+      The rule ids of this run (comma- or space-separated). The code_comment
+      schema then requires rule_id as an enum of exactly these ids, comments
+      with another rule_id are rejected (the model is told why), and the
+      poster posts only findings whose rule_id is one of them and whose links
+      are in verified_rule_links. Nothing is inferred from the finding text.
+    required: false
+    default: ''
+  verified_rule_links:
+    description: >-
+      Path of a JSON object {rule_id: {rule_url, card_url, title}} with the
+      links a caller verified before the review. Under each posted finding:
+      "Rule: [ID](rule_url) · Card: [title](card_url)". With leg_rule_ids, a
+      finding whose id has no entry here is not posted (unverified link).
+    required: false
+    default: ''
+  rule_stats_file:
+    description: >-
+      Path of a JSON file {findings, rejected_no_rule,
+      rejected_unverified_link} written by the poster when leg_rule_ids is set.
+    required: false
+    default: ''
   stream_progress:
     description: >-
       Stream live [ocr] review progress to the workflow log (human audience
@@ -1009,6 +1032,7 @@ runs:
         OCR_PRICE_CACHE_HIT_PER_M: ${{ inputs.price_cache_hit_per_m }}
         OCR_PRICE_OUTPUT_PER_M: ${{ inputs.price_output_per_m }}
         OCR_USAGE_FILE: ${{ inputs.usage_file }}
+        OCR_LEG_RULE_IDS: ${{ inputs.leg_rule_ids }}
         # Step output, not job env: empty when the resolve step was skipped or
         # chose the full range, and never inherited from an earlier use of this
         # action in the same job.
@@ -1112,6 +1136,9 @@ runs:
         OCR_FEEDBACK_LEG: ${{ inputs.feedback_leg }}
         OCR_FEEDBACK_MODEL: ${{ inputs.llm_model }}
         OCR_RULESET_VERSION: ${{ inputs.ruleset_version }}
+        OCR_LEG_RULE_IDS: ${{ inputs.leg_rule_ids }}
+        OCR_RULE_STATS_FILE: ${{ inputs.rule_stats_file }}
+        OCR_VERIFIED_RULE_LINKS: ${{ inputs.verified_rule_links }}
       with:
         github-token: ${{ inputs.github_token }}
         script: |

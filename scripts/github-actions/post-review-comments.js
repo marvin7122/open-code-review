@@ -259,7 +259,10 @@ async function runPostReviewComments({
     }
   }
 
-  const comments = result.comments || [];
+  const gate = gateFindingRules(result.comments || [], parseRuleIds(process.env.OCR_LEG_RULE_IDS),
+    loadVerifiedLinks(), log);
+  const comments = gate.posted;
+  writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, gate.stats, log);
   const warnings = result.warnings || [];
   stats.total = comments.length;
 
@@ -1690,16 +1693,94 @@ function loadRuleCards() {
   return ruleCardsCache;
 }
 
-// The rule id a finding of a project rule starts with (e.g. "PP7: ..."), or
-// null.
+// Matches a rule id: CPP15, QC18b, rule:includes.
+const RULE_ID_PATTERN = "(?:[A-Z]{2,4}\\d+[a-z]?|rule:[a-z-]+)";
+
+// The rule id of a finding: the one gateFindingRules accepted (comment.rule),
+// else the id its text starts with (e.g. "PP7: ...", only when no rule ids
+// are configured), else null.
 function findingRuleId(comment) {
-  const match = /^\s*\**`?((?:[A-Z]{2,4}\d+[a-z]?)|(?:rule:[a-z-]+))`?\**(?=[:\s,.)])/.exec(comment.content || "");
+  if (comment.rule) return comment.rule;
+  const match = new RegExp(`^\\s*\\**\`?(${RULE_ID_PATTERN})\`?\\**(?=[:\\s,.)])`).exec(comment.content || "");
   return match ? match[1] : null;
+}
+
+// The rule ids of this run (OCR_LEG_RULE_IDS, comma- or space-separated).
+function parseRuleIds(raw) {
+  return (raw || "").split(/[\s,]+/).filter(Boolean);
+}
+
+// The verified links per rule id (OCR_VERIFIED_RULE_LINKS: a JSON object
+// {id: {rule_url, card_url, title}} written by the caller's link check),
+// loaded once; {} when unset or unreadable.
+let verifiedLinksCache;
+function loadVerifiedLinks() {
+  if (verifiedLinksCache !== undefined) return verifiedLinksCache;
+  verifiedLinksCache = {};
+  const file = process.env.OCR_VERIFIED_RULE_LINKS;
+  if (!file) return verifiedLinksCache;
+  try {
+    const parsed = JSON.parse(require("fs").readFileSync(file, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) verifiedLinksCache = parsed;
+  } catch (e) {
+    console.log(`::warning::Ignoring verified rule links ${file}: ${e.message}`);
+  }
+  return verifiedLinksCache;
+}
+
+// The posting gate, when the run's rule ids are known: a finding is posted
+// only if its rule_id (the structured field of its code_comment call, never
+// inferred from the text) is one of the run's rule ids, and both links of
+// that id (the rule's permalink and its card) are in the verified set.
+// Rejected findings are logged and counted by reason. A posted finding
+// starts with "<id>: " and carries its links. Returns the findings to post
+// and {findings, rejected_no_rule, rejected_unverified_link}. Without rule
+// ids every finding is posted unchanged.
+function gateFindingRules(comments, ruleIds, verified = {}, log = console.log) {
+  const stats = { findings: comments.length, rejected_no_rule: 0, rejected_unverified_link: 0 };
+  if (ruleIds.length === 0) return { posted: comments, stats };
+  const known = new Set(ruleIds);
+  const posted = [];
+  for (const comment of comments) {
+    const rule = comment.rule_id;
+    const links = verified[rule];
+    let reason = null;
+    if (!rule || !known.has(rule)) reason = "no valid rule";
+    else if (!links || !links.rule_url || !links.card_url) reason = "unverified link";
+    if (reason) {
+      stats[reason === "no valid rule" ? "rejected_no_rule" : "rejected_unverified_link"] += 1;
+      log(`Rejected finding (${reason}; rule_id ${JSON.stringify(rule || null)}) at ${comment.path}:${comment.start_line}: ${comment.content}`);
+      continue;
+    }
+    comment.rule = rule;
+    comment.ruleLinks = links;
+    if (!new RegExp(`^\\s*\\**\`?${rule.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\`?\\**[:\\s]`).test(comment.content || "")) {
+      comment.content = `${rule}: ${comment.content || ""}`;
+    }
+    posted.push(comment);
+  }
+  stats.findings = posted.length;
+  return { posted, stats };
+}
+
+// Write the rule statistics for the review's spend comment, if asked to.
+function writeRuleStats(fs, file, stats, log = console.log) {
+  if (!file) return;
+  try {
+    fs.writeFileSync(file, JSON.stringify(stats));
+  } catch (e) {
+    log(`::warning::Could not write rule stats ${file}: ${e.message}`);
+  }
 }
 
 // When the finding's rule has a knowledge card, return a trailing line
 // linking it: "Rule [PP7](<url>): <title>". Otherwise "".
 function buildRuleCardLine(comment, cards = loadRuleCards()) {
+  // A gated finding links its rule's entry and its card, both verified.
+  if (comment.ruleLinks) {
+    const { rule_url: ruleUrl, card_url: cardUrl, title } = comment.ruleLinks;
+    return `\n\nRule: [${comment.rule}](${ruleUrl}) · Card: [${title || comment.rule}](${cardUrl})`;
+  }
   const ruleId = findingRuleId(comment);
   const card = ruleId ? cards[ruleId] : null;
   if (!card || !card.url) return "";
@@ -2746,6 +2827,8 @@ module.exports = {
   buildRuleCardLine,
   buildFeedbackMeta,
   findingRuleId,
+  gateFindingRules,
+  parseRuleIds,
   FEEDBACK_LEGEND,
   formatComment,
   formatCommentMarkdown,

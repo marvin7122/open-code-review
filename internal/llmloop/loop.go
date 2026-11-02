@@ -670,6 +670,16 @@ func (r *Runner) executeToolCall(ctx context.Context, taskKey string, call llm.T
 			return tool.Of(errMsg)
 		}
 
+		// With the run's rule ids set, a comment must name one of them in
+		// rule_id; the others are rejected and the model is told why.
+		ruleIDs := tool.RuleIDsFromEnv()
+		comments, rejected := tool.FilterCommentsByRuleID(comments, ruleIDs)
+		for _, cm := range rejected {
+			r.RecordWarning("comment_rejected_rule_id", cm.Path,
+				fmt.Sprintf("rule_id %q is not one of the review's rules; comment dropped: %s", cm.RuleID, cm.Content))
+		}
+		commentResult := tool.CommentSucceed + tool.RejectedRuleIDNote(rejected, ruleIDs)
+
 		// Batched comments share the turn's thinking.
 		if thinking != "" {
 			for i := range comments {
@@ -754,7 +764,7 @@ func (r *Runner) executeToolCall(ctx context.Context, taskKey string, call llm.T
 				return []model.LlmComment{}, nil
 			})
 			telemetry.RecordToolCall(asyncCtx, toolName, time.Since(startTime), true)
-			return tool.Of(tool.CommentSucceed)
+			return tool.Of(commentResult)
 		}
 
 		resolveAndCollect(ctx)
@@ -764,9 +774,9 @@ func (r *Runner) executeToolCall(ctx context.Context, taskKey string, call llm.T
 		telemetry.RecordToolCall(ctx, t.Name(), dur, true)
 		telemetry.PrintToolCallFinished(t.Name(), dur)
 		if rec != nil {
-			rec.AddToolResult(t.Name(), call.Function.Arguments, tool.CommentSucceed)
+			rec.AddToolResult(t.Name(), call.Function.Arguments, commentResult)
 		}
-		return tool.Of(tool.CommentSucceed)
+		return tool.Of(commentResult)
 	}
 
 	// Synchronous path for all other tools

@@ -144,6 +144,9 @@ func parseCommentsInner(args map[string]any, defaultPath string) ([]model.LlmCom
 		if severity, ok := obj["severity"].(string); ok {
 			cm.Severity = normalizeCodeCommentSeverity(severity)
 		}
+		if ruleID, ok := obj["rule_id"].(string); ok {
+			cm.RuleID = strings.TrimSpace(ruleID)
+		}
 		if path, ok := obj["path"].(string); ok && path != "" {
 			cm.Path = path
 		}

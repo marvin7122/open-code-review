@@ -1112,6 +1112,55 @@ func TestDispatchSubtasks_TokenThresholdSkipIsNotReusableCheckpoint(t *testing.T
 	}
 }
 
+// A run that its hard budget stops before any file finishes is truncated, not
+// failed: no "all file reviews failed" error (fan-out leg 7 of run
+// 41433048860 exited 1 with that error after hitting its call cap).
+func TestDispatchSubtasks_HardBudgetStopIsNotAFailure(t *testing.T) {
+	tmpHome := t.TempDir()
+	setTestHome(t, tmpHome)
+	t.Setenv("OCR_MAX_LLM_CALLS", "1")
+	repoDir := t.TempDir()
+	sess := session.New(repoDir, "feature", "fake", session.SessionOptions{
+		ReviewMode: session.ReviewModeRange,
+		DiffFrom:   "main",
+		DiffTo:     "feature",
+	})
+
+	emptyContent := ""
+	client := &fakeAgentClient{responses: []*llm.ChatResponse{{
+		Choices: []llm.Choice{{Message: llm.ResponseMessage{Content: &emptyContent}}},
+		Model:   "fake",
+		Usage:   &llm.UsageInfo{PromptTokens: 10, CompletionTokens: 1},
+	}}}
+	a := New(Args{
+		From:      "main",
+		To:        "feature",
+		LLMClient: client,
+		Model:     "fake",
+		Session:   sess,
+		Template: template.Template{
+			MaxTokens:           100000,
+			MaxToolRequestTimes: 5,
+			MainTask: template.LlmConversation{
+				Messages: []template.ChatMessage{{Role: "user", Content: "Review {{diffs}}"}},
+			},
+		},
+	})
+	a.diffs = []model.Diff{{NewPath: "needs-review.go", OldPath: "needs-review.go", Diff: "+x", Insertions: 1}}
+	a.currentDate = "2025-06-26 10:00"
+
+	if _, err := a.dispatchSubtasks(context.Background()); err != nil {
+		t.Fatalf("a budget-truncated run returned %v, want no error", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("LLM calls = %d, want 1 (the call cap)", client.calls)
+	}
+	if !a.runner.Truncated() {
+		t.Fatal("run not marked truncated")
+	}
+	sess.Finalize()
+}
+
 func TestDispatchSubtasks_MainTaskWithoutTaskDoneIsNotReusableCheckpoint(t *testing.T) {
 	tmpHome := t.TempDir()
 	setTestHome(t, tmpHome)

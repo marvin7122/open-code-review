@@ -79,6 +79,10 @@
                 "path": {
                   "type": "string",
                   "description": "The relative file path this comment applies to."
+                },
+                "rule_id": {
+                  "type": "string",
+                  "description": "The ID of the project rule this comment reports, exactly as the review instructions name it (e.g. \"QC18\" or \"rule:includes\"). Always set it when the instructions list rules with IDs; the comment content should also start with it."
                 }
               },
               "required": [
