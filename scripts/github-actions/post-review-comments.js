@@ -1824,7 +1824,22 @@ function unverifiedNote(comment) {
 
 // The reactions a reviewer can leave on a finding; a scheduled job collects
 // them per rule (OCR_FEEDBACK_LEGEND=true adds this line).
-const FEEDBACK_LEGEND = "React: 👍 actionable · ❤️ valuable · 🚀 fixed · 😕 not actionable · 👎 wrong · 👀 duplicate";
+// The legend is generated from feedback-legend.json, the one definition of
+// the reactions and reply keywords that the feedback collection
+// (marvin7122/ocr-runners feedback/) reads too: one line with every reaction,
+// then the reply keywords in a collapsible block.
+const FEEDBACK_DEFINITION = require("./feedback-legend.json");
+
+function buildFeedbackLegend(definition = FEEDBACK_DEFINITION) {
+  const reactions = "React: " + definition.reactions.map((r) => `${r.emoji} ${r.meaning}`).join(" · ");
+  const keywords = definition.keywords
+    .map((k) => `- \`${k.keyword}${k.takes_text ? " <text>" : ""}\` — ${k.meaning}`)
+    .join("\n");
+  return `${reactions}\n\n<details><summary>Reply keywords</summary>\n\n` +
+    `Reply to this comment, starting with one of:\n\n${keywords}\n</details>`;
+}
+
+const FEEDBACK_LEGEND = buildFeedbackLegend();
 
 // A hidden marker that attributes the finding for the feedback collection:
 // its rule id, the fan-out leg, the model and the rule-set version (from
@@ -3010,6 +3025,7 @@ module.exports = {
   escapeLinkText,
   parseRuleIds,
   FEEDBACK_LEGEND,
+  buildFeedbackLegend,
   formatComment,
   formatCommentMarkdown,
   buildSummaryBody,

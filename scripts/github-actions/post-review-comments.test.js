@@ -16,7 +16,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, gateFindingRules, parseRuleIds, parseCitations, anchorRange, renderExcerpt, addFindingContext, escapeLinkText, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, gateFindingRules, buildFeedbackLegend, parseRuleIds, parseCitations, anchorRange, renderExcerpt, addFindingContext, escapeLinkText, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -2361,7 +2361,28 @@ async function testFindingContext() {
   assert.ok(!formatComment({ content: "QC18: x" }).includes("Unverified"));
 }
 
+// The legend lists every reaction and every reply keyword of the shared
+// definition, and follows it when the definition changes.
+function testFeedbackLegendFromDefinition() {
+  const definition = require(path.join(__dirname, "feedback-legend.json"));
+  const legend = buildFeedbackLegend(definition);
+  const [line, rest] = legend.split("\n\n<details>");
+  assert.ok(line.startsWith("React: "), line);
+  for (const r of definition.reactions) assert.ok(line.includes(`${r.emoji} ${r.meaning}`), r.key);
+  assert.strictEqual(definition.reactions.length, 8, "GitHub allows exactly eight reactions");
+  assert.ok(rest.startsWith("<summary>Reply keywords</summary>"), rest);
+  for (const k of definition.keywords) {
+    assert.ok(rest.includes(`\`${k.keyword}${k.takes_text ? " <text>" : ""}\` — ${k.meaning}`), k.keyword);
+  }
+  assert.ok(rest.endsWith("</details>"));
+  assert.strictEqual(FEEDBACK_LEGEND, legend, "the posted legend is the generated one");
+
+  const custom = buildFeedbackLegend({ reactions: [{ emoji: "👍", meaning: "good" }], keywords: [{ keyword: "/x", takes_text: true, meaning: "why" }] });
+  assert.ok(custom.startsWith("React: 👍 good\n\n") && custom.includes("- `/x <text>` — why"), custom);
+}
+
 async function main() {
+  testFeedbackLegendFromDefinition();
   await testFindingContext();
   testRuleCardLine();
   testGateFindingRules();
