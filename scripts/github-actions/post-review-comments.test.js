@@ -16,7 +16,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -2233,8 +2233,34 @@ function testRuleCardLine() {
   assert.strictEqual(buildRuleCardLine({}, cards), "", "no content");
 }
 
+// The feedback marker attributes a finding to its rule, leg, model and rule
+// set; the legend lists the reactions. Neither disturbs the id marker.
+function testFeedbackMetaAndLegend() {
+  const env = { OCR_FEEDBACK_LEG: "3", OCR_FEEDBACK_MODEL: "deepseek-flash", OCR_RULESET_VERSION: "abc123" };
+  const meta = buildFeedbackMeta({ content: "PP7: Use EXPECT_THAT." }, env);
+  const parsed = JSON.parse(/<!-- ocr-meta (.*) -->/.exec(meta)[1]);
+  assert.deepStrictEqual(parsed, { rule: "PP7", leg: "3", model: "deepseek-flash", ruleset: "abc123" });
+  assert.strictEqual(buildFeedbackMeta({ content: "No rule id here" }, {}), "", "nothing known, no marker");
+  assert.ok(!buildFeedbackMeta({ content: "PP7: a --> b" }, env).slice(0, -5).includes("-->"), "marker cannot close early");
+  assert.strictEqual(findingRuleId({ content: "rule:includes: x" }), "rule:includes");
+
+  const saved = process.env.OCR_FEEDBACK_LEGEND;
+  try {
+    process.env.OCR_FEEDBACK_LEGEND = "true";
+    const body = formatComment({ content: "PP7: Use EXPECT_THAT." }, "ocr-1-1-abcdef0123456789");
+    assert.ok(body.startsWith("<!-- ocr-1-1-abcdef0123456789 -->\n"), "id marker first");
+    assert.ok(body.endsWith(FEEDBACK_LEGEND), "legend last");
+    delete process.env.OCR_FEEDBACK_LEGEND;
+    assert.ok(!formatComment({ content: "PP7: x" }, "ocr-1-1-ab").includes("React:"), "legend only when enabled");
+  } finally {
+    if (saved === undefined) delete process.env.OCR_FEEDBACK_LEGEND;
+    else process.env.OCR_FEEDBACK_LEGEND = saved;
+  }
+}
+
 async function main() {
   testRuleCardLine();
+  testFeedbackMetaAndLegend();
   await testFailedInlineCommentsAreSummarized();
   await testWarningsListedAfterSummaryComments();
   await testErrorCommentUsesSafeFence();
