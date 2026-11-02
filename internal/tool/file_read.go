@@ -35,7 +35,8 @@ func (p *FileReadProvider) Execute(ctx context.Context, args map[string]any) (st
 		endLine = 0
 	}
 
-	maxLines := fileReadMaxLines
+	lineCap := fileReadLineCap()
+	maxLines := lineCap
 	if endLine > 0 {
 		requested := int(endLine) - int(startLine) + 1
 		if requested <= 0 {
@@ -60,7 +61,7 @@ func (p *FileReadProvider) Execute(ctx context.Context, args map[string]any) (st
 		effectiveEnd = int(endLine)
 	}
 	fullRange := effectiveEnd - (int(startLine) - 1)
-	truncated := fullRange > fileReadMaxLines
+	truncated := fullRange > lineCap
 
 	displayEnd := int(startLine) - 1 + len(lines)
 
@@ -72,7 +73,7 @@ func (p *FileReadProvider) Execute(ctx context.Context, args map[string]any) (st
 		sb.WriteString(fmt.Sprintf("%d|%s\n", int(startLine)+i, line))
 	}
 	if truncated {
-		sb.WriteString(fmt.Sprintf("\nNote: Results truncated to %d lines. Please narrow your line range.\n", fileReadMaxLines))
+		sb.WriteString(fmt.Sprintf("\nNote: Results truncated to %d lines. Please narrow your line range.\n", lineCap))
 	}
 	return sb.String(), nil
 }

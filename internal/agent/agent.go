@@ -1917,6 +1917,7 @@ func (a *Agent) executeGroupReviewFilter(ctx context.Context, g FileGroup, from 
 		llm.SessionTaskKey(a.session.SessionID, string(session.ReviewFilterTask), groupKey))
 	startTime := time.Now()
 	reqCtx := llm.WithRequestMeta(ctx, a.newRequestMeta(groupKey, session.ReviewFilterTask, rec.RequestNo))
+	reqCtx = llm.WithExtraBodyOverride(reqCtx, reviewFilterExtraBody())
 
 	_, llmSpan := telemetry.StartLLMSpan(ctx, a.args.Model)
 	resp, err := a.args.LLMClient.CompletionsWithCtx(reqCtx, llm.ChatRequest{

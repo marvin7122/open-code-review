@@ -616,7 +616,7 @@ func (c *OpenAIClient) CompletionsWithCtx(ctx context.Context, req ChatRequest) 
 	for k, v := range expandSessionKeyInHeaders(c.cfg.ExtraHeaders, sessionKey) {
 		opts = append(opts, openaiopt.WithHeader(k, v))
 	}
-	for k, v := range expandSessionKeyInBody(c.cfg.ExtraBody, sessionKey) {
+	for k, v := range expandSessionKeyInBody(effectiveExtraBody(ctx, c.cfg.ExtraBody), sessionKey) {
 		// Skip the "stream" key here. The streaming decision below uses a
 		// dedicated boolean check, and when streaming is enabled the SDK's
 		// NewStreaming method sets stream=true on the wire itself. When
@@ -1292,7 +1292,7 @@ func (c *AnthropicClient) CompletionsWithCtx(ctx context.Context, req ChatReques
 	for k, v := range expandSessionKeyInHeaders(c.cfg.ExtraHeaders, sessionKey) {
 		opts = append(opts, option.WithHeader(k, v))
 	}
-	for k, v := range expandSessionKeyInBody(c.cfg.ExtraBody, sessionKey) {
+	for k, v := range expandSessionKeyInBody(effectiveExtraBody(ctx, c.cfg.ExtraBody), sessionKey) {
 		// This client is non-streaming: it calls Messages.New, which expects a
 		// single JSON body. If a provider config sets extra_body.stream=true,
 		// forwarding it here makes the API answer with SSE and every call fails
