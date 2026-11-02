@@ -1,28 +1,33 @@
 {
-  "_comment": "The one definition of the reviewer feedback on OpenCodeReview findings: the poster renders the legend under every finding from it, and marvin7122/ocr-runners feedback/collect.py and propose.py read reactions and reply keywords with it. Change meanings only here. Keywords with \"feedback\": false are commands of the apply-replies flow (marvin7122/qlever .opencodereview/apply_replies.py), not feedback on the finding; \"scope\": \"pr\" marks those posted as a PR comment instead of a reply.",
-  "version": 2,
+  "_comment": "The one definition of the reviewer feedback on OpenCodeReview findings: the poster renders the legend under every finding from it, and marvin7122/ocr-runners feedback/collect.py and propose.py read reactions and reply keywords with it. Change meanings only here. Keywords with \"feedback\": false are commands of the apply-replies flow (marvin7122/qlever .opencodereview/apply_replies.py), not feedback on the finding; \"scope\": \"pr\" marks those posted as a PR comment instead of a reply. A legacy entry keeps its old meaning for reactions and replies made before the cut-over of `until_version` (the first commit of this file with that version on the default branch).",
+  "version": 3,
   "reactions": [
     { "content": "+1", "emoji": "👍", "key": "actionable", "meaning": "actionable" },
     { "content": "heart", "emoji": "❤️", "key": "valuable", "meaning": "valuable" },
     { "content": "rocket", "emoji": "🚀", "key": "fixed", "meaning": "fixed" },
     { "content": "-1", "emoji": "👎", "key": "wrong", "meaning": "wrong" },
-    { "content": "eyes", "emoji": "👀", "key": "duplicate", "meaning": "duplicate" },
-    { "content": "confused", "emoji": "😕", "key": "confusing", "meaning": "confusing" },
-    { "content": "laugh", "emoji": "😄", "key": "too_long", "meaning": "too long, didn't read" },
+    { "content": "eyes", "emoji": "👀", "key": "duplicate", "meaning": "duplicate of the finding on overlapping lines (name it with /duplicate <link>)" },
+    { "content": "confused", "emoji": "😕", "key": "confusing", "meaning": "confusing → rewritten with a concrete proposal" },
+    { "content": "laugh", "emoji": "😄", "key": "too_long", "meaning": "too long → TL;DR rewrite with a concrete proposal" },
     { "content": "hooray", "emoji": "🎉", "key": "improvement_potential", "meaning": "improvement potential (right idea, the comment should be better)" }
   ],
   "legacy_reactions": [
-    { "content": "confused", "key": "not_actionable", "reason": "Version 1 of the legend defined 😕 as \"not actionable\". A 😕 made before the cut-over (the first commit of this file with version 2 on the default branch) keeps that meaning." }
+    { "content": "confused", "key": "not_actionable", "until_version": 2, "reason": "Version 1 of the legend defined 😕 as \"not actionable\". A 😕 made before the version-2 cut-over keeps that meaning." }
   ],
   "keywords": [
-    { "keyword": "/not-actionable", "key": "not_actionable", "takes_text": false, "meaning": "correct, but not worth acting on" },
+    { "keyword": "/not-actionable", "key": "not_executable", "takes_text": false, "meaning": "not actionable as written → rewritten as a concrete, executable proposal" },
+    { "keyword": "/skip", "key": "skip", "takes_text": true, "meaning": "correct, but I won't act on it (no code change; the thread is resolved)" },
+    { "keyword": "/duplicate", "key": "duplicate", "takes_text": true, "meaning": "duplicate of the finding at <link> (its URL or #discussion_r<id>); only the original is fixed" },
     { "keyword": "/improve", "key": "improve", "takes_text": true, "meaning": "how this comment should be better" },
     { "keyword": "/wrong", "key": "wrong", "takes_text": true, "meaning": "why it is wrong" },
     { "keyword": "/approve", "key": "actionable", "takes_text": false, "meaning": "apply the change proposed in this thread" },
     { "keyword": "/reject", "key": "reject", "takes_text": false, "feedback": false, "meaning": "drop the change proposed in this thread" },
-    { "keyword": "/apply-replies", "key": "apply_replies", "takes_text": false, "feedback": false, "scope": "pr", "meaning": "(as a PR comment, not a reply) act on all reactions and replies: mechanical fixes are committed, behavior changes are proposed for /approve" },
+    { "keyword": "/apply-replies", "key": "apply_replies", "takes_text": false, "feedback": false, "scope": "pr", "meaning": "(as a PR comment, not a reply) act on all reactions and replies: mechanical fixes are committed, the rest is proposed for /approve" },
     { "keyword": "/approve-all", "key": "approve_all", "takes_text": false, "feedback": false, "scope": "pr", "meaning": "(as a PR comment, not a reply) apply every pending proposal" }
   ],
+  "legacy_keywords": [
+    { "keyword": "/not-actionable", "key": "not_actionable", "until_version": 3, "reason": "Up to version 2, /not-actionable meant \"correct, but not worth acting on\" (now /skip). A reply made before the version-3 cut-over keeps that meaning." }
+  ],
   "useful": ["actionable", "valuable", "fixed"],
-  "wording": ["confusing", "too_long"]
+  "wording": ["confusing", "too_long", "not_executable"]
 }
