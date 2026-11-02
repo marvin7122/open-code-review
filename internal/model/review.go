@@ -24,6 +24,19 @@ type LlmComment struct {
 	// Unverified marks a finding the review filter could not check because
 	// the run's budget was used up; it is posted with a visible note.
 	Unverified bool `json:"unverified,omitempty"`
+	// Changes is the code change the finding implies, as replacement text for
+	// exact line ranges; the poster turns each into a one-click suggestion.
+	Changes []CodeChange `json:"changes,omitempty"`
+}
+
+// CodeChange replaces the lines StartLine..EndLine (1-based, inclusive,
+// numbered as in the file at the reviewed head commit) of Path with
+// Replacement. An empty Replacement deletes the lines.
+type CodeChange struct {
+	Path        string `json:"path"`
+	StartLine   int    `json:"start_line"`
+	EndLine     int    `json:"end_line"`
+	Replacement string `json:"replacement"`
 }
 
 // CodeReviewResult holds raw LLM-generated review suggestion for a code segment.

@@ -17,6 +17,7 @@
 
 const crypto = require("crypto");
 const path = require("path");
+const { applySuggestions, clangFormatCheck, renderChangeDiff, renderFallback } = require("./suggestions.js");
 
 const SUMMARY_MARKER = "<!-- ocr-summary -->";
 
@@ -301,14 +302,28 @@ async function runPostReviewComments({
 
   // Anchor every finding over its lines, attach code excerpts from the head
   // commit, and reject findings that cite a missing file or line.
+  const diffCache = {};
   if (process.env.OCR_FINDING_CONTEXT === "true" && comments.length > 0) {
-    const diff = await getPrDiffHunks({ github, owner, repo, prNumber, commitSha, log, cache: {} });
+    const diff = await getPrDiffHunks({ github, owner, repo, prNumber, commitSha, log, cache: diffCache });
     const withContext = await addFindingContext({ github, owner, repo, sha: commitSha, comments, diff, log });
     comments = withContext.posted;
     ruleStats.findings = comments.length;
     ruleStats.rejected_invalid_citation = withContext.rejectedInvalidCitation;
     writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, ruleStats, log);
     stats.total = comments.length;
+  }
+
+  // One-click suggestions: gate each finding's code change and anchor the
+  // finding on it; a change at several places adds one companion comment per
+  // further place (see suggestions.js). Companions are not counted as findings.
+  if (process.env.OCR_ONE_CLICK_SUGGESTIONS === "true" && comments.length > 0) {
+    const diff = await getPrDiffHunks({ github, owner, repo, prNumber, commitSha, log, cache: diffCache });
+    const lineCache = new Map();
+    const getLines = (p) => fetchFileLines({ github, owner, repo, sha: commitSha, path: p, cache: lineCache, log });
+    const applied = await applySuggestions({ comments, diff, getLines, formatCheck: clangFormatCheck(), log });
+    comments = applied.comments;
+    ruleStats.suggestions = applied.stats;
+    writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, ruleStats, log);
   }
 
   // Partition: inline (with valid line info) vs summary (without) vs routed
@@ -328,7 +343,11 @@ async function runPostReviewComments({
   const reviewComments = [];
   const commentsWithoutLine = [];
   const commentsRouted = [];
+  const inlineFindings = new Set();
   for (const comment of comments) {
+    // A companion (a further place of a finding's change) is posted only
+    // together with its finding.
+    if (comment.companionOf && !inlineFindings.has(comment.companionOf)) continue;
     const hasValidLine = comment.start_line >= 1 || comment.end_line >= 1;
     if (!hasValidLine) {
       commentsWithoutLine.push({ comment, body: formatComment(comment), reason: NO_LINE_REASON });
@@ -337,7 +356,7 @@ async function runPostReviewComments({
     // Routing applies only to findings that COULD be posted inline (valid
     // line). No-line findings already go to the summary via commentsWithoutLine,
     // so they are never re-routed (avoids double-counting in the summary).
-    const route = routeComment(comment, policy);
+    const route = comment.companionOf ? { routed: false } : routeComment(comment, policy);
     if (route.routed) {
       commentsRouted.push({ comment, body: formatComment(comment), reason: route.reason });
       continue;
@@ -357,6 +376,7 @@ async function runPostReviewComments({
       reviewComment.side = "RIGHT";
     }
     reviewComments.push({ comment, reviewComment, id });
+    inlineFindings.add(comment);
   }
 
   // Incremental filtering (non-destructive): drop current inline comments
@@ -370,6 +390,8 @@ async function runPostReviewComments({
     toSend = reviewComments.filter(
       ({ reviewComment }) => !overlapsHistory(reviewComment, hist, incrementalOverlapThreshold)
     );
+    const kept = new Set(toSend.map(({ comment }) => comment));
+    toSend = toSend.filter(({ comment }) => !comment.companionOf || kept.has(comment.companionOf));
     stats.skipped = reviewComments.length - toSend.length;
     if (stats.skipped > 0) {
       log(`[incremental] skipped ${stats.skipped} overlapping comment(s); ${toSend.length} to post.`);
@@ -1849,6 +1871,7 @@ const FEEDBACK_LEGEND = buildFeedbackLegend();
 function buildFeedbackMeta(comment, env = process.env) {
   const meta = {
     rule: findingRuleId(comment),
+    ...(comment.part ? { part: comment.part } : {}),
     leg: env.OCR_FEEDBACK_LEG || null,
     model: env.OCR_FEEDBACK_MODEL || null,
     ruleset: env.OCR_RULESET_VERSION || null,
@@ -1867,11 +1890,15 @@ function formatComment(comment, id) {
   body += unverifiedNote(comment);
   body += buildRuleCardLine(comment);
   if (comment.contextBlock) body += `\n\n${comment.contextBlock}`;
-  if (comment.suggestion_code && comment.existing_code) {
+  if (comment.suggestionsGated) {
+    if (comment.suggestionBlock) body += `\n\n**Suggested change:**\n${comment.suggestionBlock}`;
+    if (comment.suggestionFallback) body += `\n\n${comment.suggestionFallback}`;
+  } else if (comment.suggestion_code && comment.existing_code) {
     body += "\n\n**Suggestion:**\n";
     body += fencedBlock(comment.suggestion_code, "suggestion");
   }
-  if (process.env.OCR_FEEDBACK_LEGEND === "true") body += `\n\n${FEEDBACK_LEGEND}`;
+  // Feedback is collected on the finding, not on its companion comments.
+  if (process.env.OCR_FEEDBACK_LEGEND === "true" && !comment.companionOf) body += `\n\n${FEEDBACK_LEGEND}`;
   return body;
 }
 
@@ -1896,7 +1923,12 @@ function formatCommentMarkdown(comment, error) {
   md += buildRuleCardLine(comment);
   if (comment.contextBlock) md += `\n\n${comment.contextBlock}`;
 
-  if (comment.suggestion_code && comment.existing_code) {
+  // In the summary no suggestion can be committed: every place as a diff.
+  if (comment.suggestionsGated) {
+    for (const loc of comment.suggestionLocations || []) {
+      md += `\n\n${loc.reason ? renderFallback(loc) : renderChangeDiff(loc)}`;
+    }
+  } else if (comment.suggestion_code && comment.existing_code) {
     md += "\n\n<details><summary>💡 Suggested Change</summary>\n\n";
     md += "**Before:**\n" + fencedBlock(comment.existing_code) + "\n\n";
     md += "**After:**\n" + fencedBlock(comment.suggestion_code) + "\n\n";

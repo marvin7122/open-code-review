@@ -52,6 +52,20 @@
                   "type": "string",
                   "description": "Corresponding suggested code snippet, maintaining consistent code style."
                 },
+                "changes": {
+                  "type": "array",
+                  "description": "Required when the finding implies a code change: the change as replacement text for exact line ranges, one entry per location (several places are several entries). Line numbers are those of the file at the reviewed head, as file_read shows them; replacement replaces the whole lines start_line..end_line, with their indentation, and an empty replacement deletes them. Only lines added or changed by this diff can take a change.",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": {"type": "string", "description": "The file of this location; defaults to the comment's path."},
+                      "start_line": {"type": "integer", "description": "First line replaced (1-based)."},
+                      "end_line": {"type": "integer", "description": "Last line replaced (inclusive)."},
+                      "replacement": {"type": "string", "description": "The new text of these lines, exactly as it should be in the file."}
+                    },
+                    "required": ["start_line", "end_line", "replacement"]
+                  }
+                },
                 "category": {
                   "type": "string",
                   "enum": [

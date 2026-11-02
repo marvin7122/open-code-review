@@ -233,7 +233,9 @@ inputs:
       Path of a JSON file written by the poster when leg_rule_ids is set:
       {findings, rejected_no_rule, rejected_unverified_link,
       rejected_invalid_citation, rejected_rule_does_not_fit,
-      reassigned_rule, unverified}.
+      reassigned_rule, unverified}, and with one_click_suggestions
+      `suggestions`: {findings_with_change, one_click, locations,
+      locations_one_click, fallback: {reason: count}}.
     required: false
     default: ''
   verify_reserve:
@@ -262,6 +264,31 @@ inputs:
       citing a missing file or line is not posted (rejected_invalid_citation).
     required: false
     default: 'false'
+  one_click_suggestions:
+    description: >-
+      When true, the code change of a finding (its `changes`: replacement
+      text for exact line ranges) is posted as GitHub suggestions: the
+      finding is anchored on its first range, every further range gets a
+      comment of its own. A range is posted as a suggestion only if it lies in
+      one diff hunk, the rendered suggestion applied to the file at the head
+      commit gives exactly the intended text, and (with
+      suggestion_clang_format) clang-format passes on the changed lines;
+      otherwise it is shown as a diff block marked "no one-click suggestion
+      possible" with the reason. Counts go to rule_stats_file.
+    required: false
+    default: 'false'
+  suggestion_clang_format:
+    description: >-
+      clang-format binary for the suggestion check on C and C++ files (e.g.
+      clang-format-18); empty skips the check.
+    required: false
+    default: ''
+  suggestion_style_file:
+    description: >-
+      The .clang-format file for that check (--style=file:<path>); empty
+      lets clang-format search from the file's path.
+    required: false
+    default: ''
   stream_progress:
     description: >-
       Stream live [ocr] review progress to the workflow log (human audience
@@ -1169,6 +1196,9 @@ runs:
         OCR_LEG_RULE_IDS: ${{ inputs.leg_rule_ids }}
         OCR_RULE_STATS_FILE: ${{ inputs.rule_stats_file }}
         OCR_FINDING_CONTEXT: ${{ inputs.finding_context }}
+        OCR_ONE_CLICK_SUGGESTIONS: ${{ inputs.one_click_suggestions }}
+        OCR_SUGGESTION_CLANG_FORMAT: ${{ inputs.suggestion_clang_format }}
+        OCR_SUGGESTION_STYLE_FILE: ${{ inputs.suggestion_style_file }}
         OCR_VERIFIED_RULE_LINKS: ${{ inputs.verified_rule_links }}
       with:
         github-token: ${{ inputs.github_token }}

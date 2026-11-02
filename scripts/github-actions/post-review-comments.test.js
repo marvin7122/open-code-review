@@ -2381,7 +2381,65 @@ function testFeedbackLegendFromDefinition() {
   assert.ok(custom.startsWith("React: 👍 good\n\n") && custom.includes("- `/x <text>` — why"), custom);
 }
 
+// OCR_ONE_CLICK_SUGGESTIONS: a finding with a change at two places is posted
+// on the first place with its suggestion plus one companion comment; a place
+// outside the diff is a marked diff block; the counts reach the stats file.
+async function testOneClickSuggestions() {
+  const fileText = "int f(int x) {\n  int y = x;\n  return y;\n}\n";
+  const result = {
+    comments: [
+      {
+        path: "src/a.cpp", start_line: 2, end_line: 3, content: "QC1: return x directly", category: "style",
+        severity: "low", rule_id: "QC1",
+        changes: [
+          { path: "src/a.cpp", start_line: 3, end_line: 3, replacement: "  return x;" },
+          { path: "src/a.cpp", start_line: 2, end_line: 2, replacement: "" },
+          { path: "src/other.cpp", start_line: 1, end_line: 1, replacement: "x" },
+        ],
+      },
+      { path: "src/a.cpp", start_line: 1, end_line: 1, content: "QC2: no change", category: "style", severity: "low" },
+    ],
+  };
+  const github = makeGithub({ files: [{ filename: "src/a.cpp", patch: "@@ -0,0 +1,4 @@\n+a\n+b\n+c\n+d" }] });
+  github.rest.repos = { getContent: async ({ path: p }) => {
+    if (p !== "src/a.cpp") throw Object.assign(new Error("Not Found"), { status: 404 });
+    return { data: { content: Buffer.from(fileText).toString("base64"), encoding: "base64" } };
+  } };
+  const written = {};
+  const fs = {
+    readFileSync: mockFs(JSON.stringify(result), "").readFileSync,
+    writeFileSync(file, text) { written[file] = text; },
+  };
+  const saved = { ...process.env };
+  Object.assign(process.env, { OCR_ONE_CLICK_SUGGESTIONS: "true", OCR_RULE_STATS_FILE: "/tmp/stats.json",
+    OCR_FEEDBACK_LEGEND: "true", OCR_SUGGESTION_CLANG_FORMAT: "" });
+  try {
+    await runPostReviewComments({ github, context, core: mockCore(), fs, incremental: false });
+  } finally {
+    for (const k of ["OCR_ONE_CLICK_SUGGESTIONS", "OCR_RULE_STATS_FILE", "OCR_FEEDBACK_LEGEND", "OCR_SUGGESTION_CLANG_FORMAT"]) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+  const posted = github.createReviewCalls[0].comments;
+  assert.strictEqual(posted.length, 3, "finding, its companion, and the finding without a change");
+  const finding = posted.find((c) => c.body.includes("QC1: return x directly") && !c.body.includes("Part 2"));
+  assert.deepStrictEqual([finding.path, finding.line, finding.start_line, finding.side], ["src/a.cpp", 3, undefined, "RIGHT"]);
+  assert.ok(finding.body.includes("**Suggested change:**\n```suggestion\n  return x;\n```"));
+  assert.ok(finding.body.includes("⚠ no one-click suggestion possible: the lines are not in the PR diff"));
+  assert.ok(finding.body.includes("React:"), "the finding carries the legend");
+  const companion = posted.find((c) => c.body.includes("Part 2 of 2"));
+  assert.deepStrictEqual([companion.path, companion.line], ["src/a.cpp", 2]);
+  assert.ok(companion.body.includes("```suggestion\n```"), "an empty replacement deletes the line");
+  assert.ok(!companion.body.includes("React:"), "no legend on a companion");
+  assert.ok(companion.body.includes('"part":"2/2"'));
+  const stats = JSON.parse(written["/tmp/stats.json"]);
+  assert.deepStrictEqual(stats.suggestions, { findings_with_change: 1, one_click: 0, locations: 3, locations_one_click: 2,
+    fallback: { outside_diff: 1 } });
+}
+
 async function main() {
+  await testOneClickSuggestions();
   testFeedbackLegendFromDefinition();
   await testFindingContext();
   testRuleCardLine();

@@ -6,6 +6,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -358,4 +359,38 @@ func TestCodeCommentProvider_Execute(t *testing.T) {
 			t.Errorf("Tool() = %v, want CodeComment", p.Tool())
 		}
 	})
+}
+
+func TestParseCommentsReadsChanges(t *testing.T) {
+	args := map[string]any{"comments": []any{map[string]any{
+		"content": "QC1: use a reference", "path": "src/a.cpp", "existing_code": "x",
+		"changes": []any{
+			map[string]any{"start_line": float64(3), "end_line": float64(4), "replacement": "a\nb"},
+			map[string]any{"path": "src/b.h", "start_line": "7", "end_line": "7", "replacement": ""},
+			map[string]any{"start_line": json.Number("9"), "end_line": json.Number("9"), "replacement": "c"},
+			map[string]any{"start_line": float64(5), "end_line": float64(4), "replacement": "inverted"},
+			map[string]any{"start_line": float64(1), "end_line": float64(1)},
+			map[string]any{"start_line": 1.5, "end_line": float64(2), "replacement": "fraction"},
+			map[string]any{"start_line": true, "end_line": float64(2), "replacement": "not a number"},
+			"not an object",
+		},
+	}}}
+	comments, errMsg := ParseComments(args)
+	if errMsg != "" || len(comments) != 1 {
+		t.Fatalf("ParseComments: %q, %d comments", errMsg, len(comments))
+	}
+	want := []model.CodeChange{
+		{Path: "src/a.cpp", StartLine: 3, EndLine: 4, Replacement: "a\nb"},
+		{Path: "src/b.h", StartLine: 7, EndLine: 7, Replacement: ""},
+		{Path: "src/a.cpp", StartLine: 9, EndLine: 9, Replacement: "c"},
+	}
+	if !reflect.DeepEqual(comments[0].Changes, want) {
+		t.Fatalf("changes = %+v, want %+v", comments[0].Changes, want)
+	}
+	if got := parseCodeChanges([]any{map[string]any{"start_line": float64(1), "end_line": float64(1), "replacement": "x"}}, ""); got != nil {
+		t.Fatalf("a change without any path must be dropped, got %+v", got)
+	}
+	if got := parseCodeChanges("not a list", "a.cpp"); got != nil {
+		t.Fatalf("a non-list changes value must be ignored, got %+v", got)
+	}
 }
