@@ -16,7 +16,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, assignFindingRules, parseRuleIds, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, buildBadgeImage, SEVERITY_BADGE_COLOR, sanitizeMetadata, buildPolicy, routeComment, buildRuleCardLine, buildFeedbackMeta, findingRuleId, gateFindingRules, parseRuleIds, FEEDBACK_LEGEND, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks, SUMMARY_MARKER, buildCheckpointMarker, parseCheckpointMarker, validateCheckpointPayload, readCheckpointComment, resolveCheckpointRange, isCheckpointAuthorOurs, preserveCheckpointMarker, tailForComment, parseSessionIdFromStderr, loadSalvagedSessionComments, MAX_COMMENT_STDERR_CHARS } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -2258,38 +2258,50 @@ function testFeedbackMetaAndLegend() {
   }
 }
 
-// Before posting, every finding gets one of the run's rule ids: the tool's
-// rule_id, the leading id, an id mentioned in the text, or "unknown".
-function testAssignFindingRules() {
+// The posting gate: only findings whose structured rule_id is one of the
+// run's rule ids and whose links are verified are posted; nothing is inferred
+// from the text. A posted finding links its rule entry and its card.
+function testGateFindingRules() {
   const ids = parseRuleIds("QC18, PP7 rule:includes");
   assert.deepStrictEqual(ids, ["QC18", "PP7", "rule:includes"]);
-  const comments = [
-    { content: "The doc misses the sentinel.", rule_id: "QC18" }, // tool says QC18
-    { content: "PP7: use EXPECT_THAT." }, // leading id
-    { content: "Missing include (see rule:includes) for std::mismatch." }, // mentioned
-    { content: "CPP99: not one of this leg's rules", rule_id: "XX1" }, // nothing known
-    { content: "Plain text without any id." },
-  ];
-  const stats = assignFindingRules(comments, ids);
-  assert.deepStrictEqual(stats, { findings: 5, unknown: 2 });
-  assert.deepStrictEqual(comments.map((c) => c.rule), ["QC18", "PP7", "rule:includes", "unknown", "unknown"]);
-  assert.strictEqual(comments[0].content, "QC18: The doc misses the sentinel.");
-  assert.strictEqual(comments[1].content, "PP7: use EXPECT_THAT.", "no double prefix");
-  assert.ok(comments[2].content.startsWith("rule:includes: "));
-  assert.strictEqual(comments[4].content, "Plain text without any id.", "unknown stays unprefixed");
-  assert.strictEqual(findingRuleId(comments[0]), "QC18");
-  assert.strictEqual(findingRuleId(comments[4]), null);
-  const meta = JSON.parse(/<!-- ocr-meta (.*) -->/.exec(buildFeedbackMeta(comments[4], {}))[1]);
-  assert.strictEqual(meta.rule, "unknown", "the marker says unknown");
+  const verified = {
+    QC18: { rule_url: "https://github.com/o/r/blob/abc/.opencodereview/rule.json#L120", card_url: "https://c/qc18.md", title: "Comments state the non-obvious" },
+    PP7: { rule_url: "https://github.com/o/r/blob/abc/.opencodereview/rule.json#L80", card_url: "https://c/pp7.md", title: "Weak test assertions" },
+  };
+  const logged = [];
+  const { posted, stats } = gateFindingRules([
+    { content: "The doc misses the sentinel.", rule_id: "QC18", path: "a.h", start_line: 3 },
+    { content: "PP7: use EXPECT_THAT.", rule_id: "PP7", path: "t.cpp", start_line: 9 },
+    { content: "QC18: mentioned in the text but no rule_id", path: "a.h", start_line: 4 },
+    { content: "not one of the run's rules", rule_id: "CPP99", path: "a.h", start_line: 5 },
+    { content: "valid id, no verified link", rule_id: "rule:includes", path: "a.h", start_line: 6 },
+  ], ids, verified, (line) => logged.push(line));
 
+  assert.deepStrictEqual(posted.map((c) => c.rule), ["QC18", "PP7"]);
+  assert.deepStrictEqual(stats, { findings: 2, rejected_no_rule: 2, rejected_unverified_link: 1 });
+  assert.strictEqual(posted[0].content, "QC18: The doc misses the sentinel.");
+  assert.strictEqual(posted[1].content, "PP7: use EXPECT_THAT.", "no double prefix");
+  assert.strictEqual(logged.length, 3, "every rejected finding is logged");
+  assert.ok(logged[0].includes("no valid rule") && logged[0].includes("mentioned in the text"), logged[0]);
+  assert.ok(logged[2].includes("unverified link"), logged[2]);
+
+  // Both links, computed only from the id.
+  assert.strictEqual(buildRuleCardLine(posted[0]),
+    "\n\nRule: [QC18](https://github.com/o/r/blob/abc/.opencodereview/rule.json#L120) · Card: [Comments state the non-obvious](https://c/qc18.md)");
+  const meta = JSON.parse(/<!-- ocr-meta (.*) -->/.exec(buildFeedbackMeta(posted[1], { OCR_RULESET_VERSION: "abc" }))[1]);
+  assert.strictEqual(meta.rule, "PP7");
+  assert.strictEqual(meta.ruleset, "abc");
+
+  // Without rule ids nothing is filtered or changed.
   const untouched = [{ content: "PP7: x" }];
-  assert.deepStrictEqual(assignFindingRules(untouched, []), { findings: 1, unknown: 0 });
-  assert.strictEqual(untouched[0].rule, undefined, "no rule ids, no change");
+  const open = gateFindingRules(untouched, []);
+  assert.strictEqual(open.posted, untouched);
+  assert.strictEqual(untouched[0].rule, undefined);
 }
 
 async function main() {
   testRuleCardLine();
-  testAssignFindingRules();
+  testGateFindingRules();
   testFeedbackMetaAndLegend();
   await testFailedInlineCommentsAreSummarized();
   await testWarningsListedAfterSummaryComments();

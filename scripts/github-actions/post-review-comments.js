@@ -259,11 +259,12 @@ async function runPostReviewComments({
     }
   }
 
-  const comments = result.comments || [];
+  const gate = gateFindingRules(result.comments || [], parseRuleIds(process.env.OCR_LEG_RULE_IDS),
+    loadVerifiedLinks(), log);
+  const comments = gate.posted;
+  writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, gate.stats, log);
   const warnings = result.warnings || [];
   stats.total = comments.length;
-  const ruleStats = assignFindingRules(comments, parseRuleIds(process.env.OCR_LEG_RULE_IDS));
-  writeRuleStats(fs, process.env.OCR_RULE_STATS_FILE, ruleStats, log);
 
   // No comments: post a "looks good" summary.
   if (comments.length === 0) {
@@ -1695,10 +1696,11 @@ function loadRuleCards() {
 // Matches a rule id: CPP15, QC18b, rule:includes.
 const RULE_ID_PATTERN = "(?:[A-Z]{2,4}\\d+[a-z]?|rule:[a-z-]+)";
 
-// The rule id of a finding: the one assignFindingRules decided (comment.rule),
-// else the id its text starts with (e.g. "PP7: ..."), else null.
+// The rule id of a finding: the one gateFindingRules accepted (comment.rule),
+// else the id its text starts with (e.g. "PP7: ...", only when no rule ids
+// are configured), else null.
 function findingRuleId(comment) {
-  if (comment.rule) return comment.rule === "unknown" ? null : comment.rule;
+  if (comment.rule) return comment.rule;
   const match = new RegExp(`^\\s*\\**\`?(${RULE_ID_PATTERN})\`?\\**(?=[:\\s,.)])`).exec(comment.content || "");
   return match ? match[1] : null;
 }
@@ -1708,34 +1710,57 @@ function parseRuleIds(raw) {
   return (raw || "").split(/[\s,]+/).filter(Boolean);
 }
 
-// Decide every finding's rule before posting, when the run's rule ids are
-// known: the rule_id the model gave in its code_comment call, if it is one of
-// them; else the id the text starts with; else one of them mentioned in the
-// text; else "unknown". A finding with a known rule starts with "<id>: ", so
-// its card link and its ocr-meta marker carry the rule. Without rule ids the
-// findings are left as they are. Returns {findings, unknown}.
-function assignFindingRules(comments, ruleIds) {
-  const stats = { findings: comments.length, unknown: 0 };
-  if (ruleIds.length === 0) return stats;
+// The verified links per rule id (OCR_VERIFIED_RULE_LINKS: a JSON object
+// {id: {rule_url, card_url, title}} written by the caller's link check),
+// loaded once; {} when unset or unreadable.
+let verifiedLinksCache;
+function loadVerifiedLinks() {
+  if (verifiedLinksCache !== undefined) return verifiedLinksCache;
+  verifiedLinksCache = {};
+  const file = process.env.OCR_VERIFIED_RULE_LINKS;
+  if (!file) return verifiedLinksCache;
+  try {
+    const parsed = JSON.parse(require("fs").readFileSync(file, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) verifiedLinksCache = parsed;
+  } catch (e) {
+    console.log(`::warning::Ignoring verified rule links ${file}: ${e.message}`);
+  }
+  return verifiedLinksCache;
+}
+
+// The posting gate, when the run's rule ids are known: a finding is posted
+// only if its rule_id (the structured field of its code_comment call, never
+// inferred from the text) is one of the run's rule ids, and both links of
+// that id (the rule's permalink and its card) are in the verified set.
+// Rejected findings are logged and counted by reason. A posted finding
+// starts with "<id>: " and carries its links. Returns the findings to post
+// and {findings, rejected_no_rule, rejected_unverified_link}. Without rule
+// ids every finding is posted unchanged.
+function gateFindingRules(comments, ruleIds, verified = {}, log = console.log) {
+  const stats = { findings: comments.length, rejected_no_rule: 0, rejected_unverified_link: 0 };
+  if (ruleIds.length === 0) return { posted: comments, stats };
   const known = new Set(ruleIds);
-  const leading = new RegExp(`^\\s*\\**\`?(${RULE_ID_PATTERN})\`?\\**(?=[:\\s,.)])`);
-  const anywhere = new RegExp(`(?<![A-Za-z0-9:])(${RULE_ID_PATTERN})(?![A-Za-z0-9-])`, "g");
+  const posted = [];
   for (const comment of comments) {
-    const content = comment.content || "";
-    const start = leading.exec(content);
-    let rule = null;
-    if (comment.rule_id && known.has(comment.rule_id)) rule = comment.rule_id;
-    else if (start && known.has(start[1])) rule = start[1];
-    else rule = [...content.matchAll(anywhere)].map((m) => m[1]).find((id) => known.has(id)) || null;
-    if (!rule) {
-      comment.rule = "unknown";
-      stats.unknown += 1;
+    const rule = comment.rule_id;
+    const links = verified[rule];
+    let reason = null;
+    if (!rule || !known.has(rule)) reason = "no valid rule";
+    else if (!links || !links.rule_url || !links.card_url) reason = "unverified link";
+    if (reason) {
+      stats[reason === "no valid rule" ? "rejected_no_rule" : "rejected_unverified_link"] += 1;
+      log(`Rejected finding (${reason}; rule_id ${JSON.stringify(rule || null)}) at ${comment.path}:${comment.start_line}: ${comment.content}`);
       continue;
     }
     comment.rule = rule;
-    if (!(start && start[1] === rule)) comment.content = `${rule}: ${content}`;
+    comment.ruleLinks = links;
+    if (!new RegExp(`^\\s*\\**\`?${rule.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\`?\\**[:\\s]`).test(comment.content || "")) {
+      comment.content = `${rule}: ${comment.content || ""}`;
+    }
+    posted.push(comment);
   }
-  return stats;
+  stats.findings = posted.length;
+  return { posted, stats };
 }
 
 // Write the rule statistics for the review's spend comment, if asked to.
@@ -1751,6 +1776,11 @@ function writeRuleStats(fs, file, stats, log = console.log) {
 // When the finding's rule has a knowledge card, return a trailing line
 // linking it: "Rule [PP7](<url>): <title>". Otherwise "".
 function buildRuleCardLine(comment, cards = loadRuleCards()) {
+  // A gated finding links its rule's entry and its card, both verified.
+  if (comment.ruleLinks) {
+    const { rule_url: ruleUrl, card_url: cardUrl, title } = comment.ruleLinks;
+    return `\n\nRule: [${comment.rule}](${ruleUrl}) · Card: [${title || comment.rule}](${cardUrl})`;
+  }
   const ruleId = findingRuleId(comment);
   const card = ruleId ? cards[ruleId] : null;
   if (!card || !card.url) return "";
@@ -1769,7 +1799,7 @@ const FEEDBACK_LEGEND = "React: 👍 actionable · ❤️ valuable · 🚀 fixed
 // unchanged. "" when none of the attributes is known.
 function buildFeedbackMeta(comment, env = process.env) {
   const meta = {
-    rule: comment.rule === "unknown" ? "unknown" : findingRuleId(comment),
+    rule: findingRuleId(comment),
     leg: env.OCR_FEEDBACK_LEG || null,
     model: env.OCR_FEEDBACK_MODEL || null,
     ruleset: env.OCR_RULESET_VERSION || null,
@@ -2797,7 +2827,7 @@ module.exports = {
   buildRuleCardLine,
   buildFeedbackMeta,
   findingRuleId,
-  assignFindingRules,
+  gateFindingRules,
   parseRuleIds,
   FEEDBACK_LEGEND,
   formatComment,
