@@ -18,6 +18,7 @@
     { "keyword": "/not-actionable", "key": "not_executable", "takes_text": false, "meaning": "not actionable as written → rewritten as a concrete, executable proposal" },
     { "keyword": "/skip", "key": "skip", "takes_text": true, "meaning": "correct, but I won't act on it (no code change; the thread is resolved)" },
     { "keyword": "/duplicate", "key": "duplicate", "takes_text": true, "meaning": "duplicate of the finding at <link> (its URL or #discussion_r<id>); only the original is fixed" },
+    { "keyword": "/split", "key": "split", "takes_text": true, "feedback": false, "meaning": "move this change into a separate PR, opened and linked here (optional text: its title); removing it from this PR waits for /approve unless the same reply says /approve" },
     { "keyword": "/improve", "key": "improve", "takes_text": true, "meaning": "how this comment should be better" },
     { "keyword": "/wrong", "key": "wrong", "takes_text": true, "meaning": "why it is wrong" },
     { "keyword": "/approve", "key": "actionable", "takes_text": false, "meaning": "apply the change proposed in this thread" },
